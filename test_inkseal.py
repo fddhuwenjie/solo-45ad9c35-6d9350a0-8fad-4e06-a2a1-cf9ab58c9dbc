@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """InkSeal 测试套件 —— 仅使用标准库 unittest。"""
 
+import hashlib
 import io
 import json
 import os
@@ -87,6 +88,60 @@ def defects_by_kind(analysis):
     for d in analysis["defects"]:
         out.setdefault(d["kind"], []).append(d)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 谱系夹具
+# --------------------------------------------------------------------------- #
+
+def sha(seed):
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
+def batch(store, doc, label="2026-09-01 送检批次", operator="采集员丁"):
+    return inkseal.add_batch(store, doc, {"label": label, "operator": operator})
+
+
+_material_seed = [0]
+
+
+def material(store, doc, kind="original", seed=None, parent=None, batch_id=None,
+             instrument="MS-200", acquired_at="2026-09-01T09:00:00Z", band=None,
+             processing=None, crop=None, digest=None):
+    if seed is None and digest is None:
+        _material_seed[0] += 1
+        seed = f"file-{_material_seed[0]}"  # 缺省唯一：不同素材不同字节
+    body = {"kind": kind, "sha256": digest or sha(seed),
+            "acquired_at": acquired_at}
+    if instrument is not None:
+        body["instrument"] = instrument
+    if batch_id is not None:
+        body["batch"] = f"b{batch_id}"
+    if band is not None:
+        body["band"] = band
+    if parent is not None:
+        body["parent"] = f"m{parent}"
+    if processing is not None:
+        body["processing"] = processing
+    if crop is not None:
+        body["crop"] = crop
+    return inkseal.add_material(store, doc, body)
+
+
+def observe_mat(store, doc, iid, mid, region=None, conditions=None, **kw):
+    body = {"intersection": f"i{iid}",
+            "direction": kw.pop("direction", "ink_first"),
+            "strength": kw.pop("strength", 5),
+            "reviewer": kw.pop("reviewer", "rA"),
+            "modality": kw.pop("modality", "microscopy"),
+            "observed_at": kw.pop("observed_at", OBS_AT),
+            "conditions": conditions or {"lighting": "同轴反射光"},
+            "calibration": kw.pop("calibration", CAL_OK),
+            "material": f"m{mid}",
+            "region": region or {"x": 10, "y": 10, "w": 50, "h": 50}}
+    body.update(kw)
+    oid, _ = inkseal.add_observation(store, doc, body)
+    return oid
 
 
 class StoreFixture(unittest.TestCase):
@@ -904,6 +959,535 @@ class VersionTests(StoreFixture):
 
 
 # --------------------------------------------------------------------------- #
+# 谱系：登记校验
+# --------------------------------------------------------------------------- #
+
+class LineageRegistrationTests(StoreFixture):
+    def test_register_batch_and_materials(self):
+        doc = new_doc(self.store)
+        b1 = batch(self.store, doc)
+        m1, dangling = material(self.store, doc, seed="photo-A",
+                                batch_id=b1, band="visible")
+        self.assertIsNone(dangling)
+        m2, _ = material(self.store, doc, kind="derived", parent=m1,
+                         processing={"sharpen": 1.2}, crop={"x": 0, "y": 0,
+                                                            "w": 100, "h": 80})
+        a = inkseal.analyze(self.store, doc)
+        lin = a["lineage"]
+        self.assertEqual([b["id"] for b in lin["batches"]], [f"b{b1}"])
+        mats = {m["id"]: m for m in lin["materials"]}
+        self.assertEqual(mats[f"m{m1}"]["kind"], "original")
+        self.assertEqual(mats[f"m{m1}"]["batch"], f"b{b1}")
+        self.assertEqual(mats[f"m{m2}"]["parent"], f"m{m1}")
+        self.assertEqual(mats[f"m{m2}"]["processing"], {"sharpen": 1.2})
+        self.assertEqual(mats[f"m{m2}"]["path"], [f"m{m2}", f"m{m1}"])
+        # 同一来源分量
+        self.assertEqual(mats[f"m{m1}"]["source"], mats[f"m{m2}"]["source"])
+        self.assertEqual(len(lin["sources"]), 1)
+        self.assertEqual(lin["sources"][0]["originals"], [f"m{m1}"])
+
+    def test_sha256_validated_and_normalized(self):
+        doc = new_doc(self.store)
+        for bad in ("abc", "z" * 64, 12345, "a" * 63):
+            with self.assertRaises(inkseal.HttpError) as cm:
+                material(self.store, doc, digest=bad)
+            self.assertEqual(cm.exception.code, "bad_sha256", bad)
+        upper = sha("photo-A").upper()
+        mid, _ = material(self.store, doc, digest=upper)
+        row = self.store.execute("SELECT sha256 FROM materials WHERE id=?",
+                                 (mid,)).fetchone()
+        self.assertEqual(row["sha256"], upper.lower())
+
+    def test_derived_requires_parent_original_forbids_parent(self):
+        doc = new_doc(self.store)
+        with self.assertRaises(inkseal.HttpError) as cm:
+            inkseal.add_material(self.store, doc, {
+                "kind": "derived", "sha256": sha("x"),
+                "acquired_at": "2026-09-01T09:00:00Z"})
+        self.assertEqual(cm.exception.code, "missing_field")
+        with self.assertRaises(inkseal.HttpError) as cm:
+            inkseal.add_material(self.store, doc, {
+                "kind": "original", "sha256": sha("y"), "parent": "m1",
+                "acquired_at": "2026-09-01T09:00:00Z"})
+        self.assertEqual(cm.exception.code, "bad_parent")
+
+    def test_bad_crop_processing_batch_rejected(self):
+        doc = new_doc(self.store)
+        m1, _ = material(self.store, doc, seed="photo-A")
+        with self.assertRaises(inkseal.HttpError) as cm:
+            material(self.store, doc, kind="derived", parent=m1,
+                     crop={"x": 0, "y": 0, "w": 0, "h": 10})
+        self.assertEqual(cm.exception.code, "bad_crop")
+        with self.assertRaises(inkseal.HttpError) as cm:
+            material(self.store, doc, kind="derived", parent=m1,
+                     processing="sharpen")
+        self.assertEqual(cm.exception.code, "bad_processing")
+        with self.assertRaises(inkseal.HttpError) as cm:
+            material(self.store, doc, seed="photo-B", batch_id=999)
+        self.assertEqual(cm.exception.status, 404)
+
+    def test_dangling_parent_allowed_then_flagged(self):
+        doc = new_doc(self.store)
+        ink, seal, _ = layers(self.store, doc)
+        iid = intersection(self.store, doc, ink, seal)
+        m1, dangling = material(self.store, doc, kind="derived", parent=99,
+                                seed="crop-of-nowhere")
+        self.assertEqual(dangling, 99)
+        o1 = observe_mat(self.store, doc, iid, m1)
+        review(self.store, o1, "rA", "accept", "甲采纳")
+        a = inkseal.analyze(self.store, doc)
+        kinds = defects_by_kind(a)
+        self.assertIn("broken_chain", kinds)
+        d = kinds["broken_chain"][0]
+        self.assertEqual(d["location"]["materials"], [f"m{m1}"])
+        self.assertEqual(d["location"]["material_path"], [f"m{m1}"])
+        self.assertFalse(a["conclusion"]["definitive"])
+        # 观察挂在断裂谱系上：不计入有效观察
+        obs = {o["id"]: o for o in a["observations"]}
+        self.assertIn("broken_chain:material lineage broken",
+                      obs[f"o{o1}"]["factual_defects"])
+        self.assertEqual(a["edges"], [])
+
+    def test_observation_material_region_rules(self):
+        doc = new_doc(self.store)
+        ink, seal, _ = layers(self.store, doc)
+        iid = intersection(self.store, doc, ink, seal)
+        m1, _ = material(self.store, doc, seed="photo-A")
+        # 绑定素材必须同时给取证区域
+        with self.assertRaises(inkseal.HttpError) as cm:
+            inkseal.add_observation(self.store, doc, {
+                "intersection": f"i{iid}", "direction": "ink_first",
+                "strength": 5, "reviewer": "rA", "modality": "microscopy",
+                "observed_at": OBS_AT, "calibration": CAL_OK,
+                "material": f"m{m1}"})
+        self.assertEqual(cm.exception.code, "missing_field")
+        # 未绑定素材不得给区域
+        with self.assertRaises(inkseal.HttpError) as cm:
+            inkseal.add_observation(self.store, doc, {
+                "intersection": f"i{iid}", "direction": "ink_first",
+                "strength": 5, "reviewer": "rA", "modality": "microscopy",
+                "observed_at": OBS_AT, "calibration": CAL_OK,
+                "region": {"x": 1, "y": 1, "w": 5, "h": 5}})
+        self.assertEqual(cm.exception.code, "bad_region")
+        # 未知素材 404；区域形状错误 422
+        with self.assertRaises(inkseal.HttpError) as cm:
+            observe_mat(self.store, doc, iid, 999)
+        self.assertEqual(cm.exception.status, 404)
+        with self.assertRaises(inkseal.HttpError) as cm:
+            observe_mat(self.store, doc, iid, m1,
+                        region={"x": 1, "y": 1, "w": -5, "h": 5})
+        self.assertEqual(cm.exception.code, "bad_region")
+
+    def test_document_requirements_validated(self):
+        for bad in ({"min_independent_sources": 0},
+                    {"min_independent_sources": "2"},
+                    {"min_independent_sources": True},
+                    {"require_cross_modal": "yes"}):
+            with self.assertRaises(inkseal.HttpError) as cm:
+                inkseal.create_document(self.store, {
+                    "summary": "x", "reviewers": REVIEWERS,
+                    "requirements": bad})
+            self.assertEqual(cm.exception.code, "bad_requirements", bad)
+        doc = inkseal.create_document(self.store, {
+            "summary": "x", "reviewers": REVIEWERS,
+            "requirements": {"min_independent_sources": 2,
+                             "require_cross_modal": True}})
+        a = inkseal.analyze(self.store, doc)
+        self.assertEqual(a["lineage"]["requirements"],
+                         {"min_independent_sources": 2,
+                          "require_cross_modal": True})
+
+
+# --------------------------------------------------------------------------- #
+# 谱系：归并与独立来源判定
+# --------------------------------------------------------------------------- #
+
+class LineageAnalysisTests(StoreFixture):
+    def _doc_with_req(self, **req):
+        body = {"summary": "谱系案", "reviewers": REVIEWERS,
+                "canvas": {"w": 1000, "h": 1400}}
+        if req:
+            body["requirements"] = req
+        return inkseal.create_document(self.store, body)
+
+    def _two_crop_setup(self, min_sources=None, overlap=False):
+        """一张照片裁成两个交叉区域，分别支撑两处观察。"""
+        doc = self._doc_with_req(
+            **({"min_independent_sources": min_sources} if min_sources else {}))
+        ink, seal, _ = layers(self.store, doc)
+        b1 = batch(self.store, doc)
+        photo, _ = material(self.store, doc, seed="photo-A", batch_id=b1)
+        crop_b = {"x": 50, "y": 50, "w": 100, "h": 100} if overlap else \
+            {"x": 200, "y": 200, "w": 100, "h": 100}
+        ca, _ = material(self.store, doc, kind="derived", parent=photo,
+                         crop={"x": 0, "y": 0, "w": 100, "h": 100},
+                         processing={"crop": True})
+        cb, _ = material(self.store, doc, kind="derived", parent=photo,
+                         crop=crop_b, processing={"crop": True})
+        i1 = intersection(self.store, doc, ink, seal, x=100, y=100)
+        i2 = intersection(self.store, doc, ink, seal, x=300, y=300)
+        o1 = observe_mat(self.store, doc, i1, ca, reviewer="rA")
+        o2 = observe_mat(self.store, doc, i2, cb, reviewer="rB")
+        review(self.store, o1, "rA", "accept", "甲采纳")
+        review(self.store, o2, "rB", "accept", "乙采纳")
+        return doc, ink, seal, photo, (ca, cb), (o1, o2)
+
+    def test_cropped_photo_counts_as_one_source(self):
+        doc, ink, seal, photo, crops, obs = self._two_crop_setup(min_sources=2)
+        a = inkseal.analyze(self.store, doc)
+        # 两块截图归并为一个独立来源：观察增加了，来源没有变
+        edge = a["edges"][0]
+        self.assertEqual(edge["corroborated_by"], 1)
+        self.assertEqual(edge["sources"], ["s1"])
+        self.assertEqual(len(edge["witnesses"]), 2)
+        kinds = defects_by_kind(a)
+        self.assertIn("insufficient_sources", kinds)
+        d = kinds["insufficient_sources"][0]
+        self.assertEqual(d["location"]["sources"], ["s1"])
+        self.assertEqual(sorted(d["location"]["observations"]),
+                         sorted(f"o{o}" for o in obs))
+        self.assertFalse(a["conclusion"]["definitive"])
+        self.assertEqual(a["conclusion"]["status"], "inconclusive")
+
+    def test_cropped_photo_ok_when_min_sources_default(self):
+        doc, *_ = self._two_crop_setup()
+        a = inkseal.analyze(self.store, doc)
+        self.assertEqual(a["edges"][0]["corroborated_by"], 1)
+        self.assertTrue(a["conclusion"]["definitive"], a["defects"])
+
+    def test_reprocessed_resubmission_dedup(self):
+        """锐化 / 伪彩 / 缩放重复送审：四次观察仍是一个来源。"""
+        doc = self._doc_with_req()
+        ink, seal, _ = layers(self.store, doc)
+        iid = intersection(self.store, doc, ink, seal)
+        photo, _ = material(self.store, doc, seed="photo-A")
+        sharp, _ = material(self.store, doc, kind="derived", parent=photo,
+                            processing={"sharpen": 1.5})
+        pseudo, _ = material(self.store, doc, kind="derived", parent=sharp,
+                             processing={"pseudocolor": "jet"})
+        scaled, _ = material(self.store, doc, kind="derived", parent=photo,
+                             processing={"scale": 2.0})
+        obs = []
+        for idx, mid in enumerate((photo, sharp, pseudo, scaled)):
+            who = "rA" if idx % 2 == 0 else "rB"
+            o = observe_mat(self.store, doc, iid, mid, reviewer=who)
+            review(self.store, o, who, "accept", f"第{idx}次送审")
+            obs.append(o)
+        a = inkseal.analyze(self.store, doc)
+        self.assertTrue(a["conclusion"]["definitive"], a["defects"])
+        edge = a["edges"][0]
+        self.assertEqual(edge["corroborated_by"], 1)
+        self.assertEqual(edge["sources"], ["s1"])
+        self.assertEqual(len(edge["witnesses"]), 4)
+        src = a["lineage"]["sources"][0]
+        self.assertEqual(len(src["materials"]), 4)
+        self.assertEqual(src["observations"], [f"o{o}" for o in obs])
+
+    def test_two_independent_originals_satisfy_min_sources(self):
+        doc = self._doc_with_req(min_independent_sources=2)
+        ink, seal, _ = layers(self.store, doc)
+        iid = intersection(self.store, doc, ink, seal)
+        ma, _ = material(self.store, doc, seed="photo-A")
+        mb, _ = material(self.store, doc, seed="photo-B",
+                         instrument="VSC-80", acquired_at="2026-09-02T09:00:00Z")
+        cal_b = {"instrument": "VSC-80", "valid_until": "2026-12-31T00:00:00Z"}
+        o1 = observe_mat(self.store, doc, iid, ma, reviewer="rA")
+        o2 = observe_mat(self.store, doc, iid, mb, reviewer="rB",
+                         calibration=cal_b)
+        review(self.store, o1, "rA", "accept", "甲采纳")
+        review(self.store, o2, "rB", "accept", "乙采纳")
+        a = inkseal.analyze(self.store, doc)
+        self.assertEqual(a["edges"][0]["corroborated_by"], 2)
+        self.assertEqual(a["edges"][0]["sources"], ["s1", "s2"])
+        self.assertTrue(a["conclusion"]["definitive"], a["defects"])
+
+    def test_duplicate_digest_blocks(self):
+        doc = self._doc_with_req()
+        ink, seal, _ = layers(self.store, doc)
+        iid = intersection(self.store, doc, ink, seal)
+        same = sha("same-file")
+        ma, _ = material(self.store, doc, digest=same)
+        mb, _ = material(self.store, doc, digest=same,
+                         acquired_at="2026-09-02T09:00:00Z")
+        o1 = observe_mat(self.store, doc, iid, ma, reviewer="rA")
+        o2 = observe_mat(self.store, doc, iid, mb, reviewer="rB")
+        review(self.store, o1, "rA", "accept", "甲")
+        review(self.store, o2, "rB", "accept", "乙")
+        a = inkseal.analyze(self.store, doc)
+        kinds = defects_by_kind(a)
+        self.assertIn("duplicate_digest", kinds)
+        d = kinds["duplicate_digest"][0]
+        self.assertEqual(d["location"]["materials"], [f"m{ma}", f"m{mb}"])
+        # 同一文件重复送审仍归并为一个来源
+        self.assertEqual(a["edges"][0]["corroborated_by"], 1)
+        self.assertFalse(a["conclusion"]["definitive"])
+
+    def test_derivation_cycle_blocks(self):
+        doc = self._doc_with_req()
+        ink, seal, _ = layers(self.store, doc)
+        iid = intersection(self.store, doc, ink, seal)
+        m1, dangling = material(self.store, doc, kind="derived", parent=2,
+                                seed="loop-a")
+        self.assertEqual(dangling, 2)  # 录入时父素材尚不存在
+        m2, _ = material(self.store, doc, kind="derived", parent=m1,
+                         seed="loop-b")
+        o1 = observe_mat(self.store, doc, iid, m1, reviewer="rA")
+        review(self.store, o1, "rA", "accept", "甲")
+        a = inkseal.analyze(self.store, doc)
+        kinds = defects_by_kind(a)
+        self.assertIn("derivation_cycle", kinds)
+        self.assertNotIn("broken_chain", kinds)  # 父引用现已闭合，只剩环
+        d = kinds["derivation_cycle"][0]
+        self.assertEqual(d["location"]["materials"], [f"m{m1}", f"m{m2}"])
+        self.assertFalse(a["conclusion"]["definitive"])
+        self.assertEqual(a["edges"], [])  # 环上素材的观察不进入推断
+
+    def test_crop_overlap_blocks(self):
+        doc, ink, seal, photo, (ca, cb), obs = self._two_crop_setup(overlap=True)
+        a = inkseal.analyze(self.store, doc)
+        kinds = defects_by_kind(a)
+        self.assertIn("crop_overlap", kinds)
+        d = kinds["crop_overlap"][0]
+        self.assertEqual(d["location"]["materials"], [f"m{ca}", f"m{cb}"])
+        self.assertEqual(d["location"]["parent"], f"m{photo}")
+        self.assertEqual(sorted(d["location"]["observations"]),
+                         sorted(f"o{o}" for o in obs))
+        self.assertFalse(a["conclusion"]["definitive"])
+
+    def test_non_overlapping_crops_no_defect(self):
+        doc, *_ = self._two_crop_setup(overlap=False)
+        a = inkseal.analyze(self.store, doc)
+        self.assertNotIn("crop_overlap", defects_by_kind(a))
+        self.assertTrue(a["conclusion"]["definitive"], a["defects"])
+
+    def test_time_inversion_material_and_observation(self):
+        doc = self._doc_with_req()
+        ink, seal, _ = layers(self.store, doc)
+        iid = intersection(self.store, doc, ink, seal)
+        parent, _ = material(self.store, doc, seed="photo-A",
+                             acquired_at="2026-09-05T09:00:00Z")
+        child, _ = material(self.store, doc, kind="derived", parent=parent,
+                            acquired_at="2026-09-01T09:00:00Z")  # 早于父素材
+        a = inkseal.analyze(self.store, doc)
+        kinds = defects_by_kind(a)
+        self.assertIn("time_inversion", kinds)
+        self.assertEqual(kinds["time_inversion"][0]["location"]["materials"],
+                         [f"m{child}", f"m{parent}"])
+        self.assertFalse(a["conclusion"]["definitive"])
+        # 观察早于素材采集时刻
+        doc2 = self._doc_with_req()
+        ink2, seal2, _ = layers(self.store, doc2)
+        iid2 = intersection(self.store, doc2, ink2, seal2)
+        m, _ = material(self.store, doc2, seed="photo-B",
+                        acquired_at="2026-09-20T09:00:00Z")
+        o1 = observe_mat(self.store, doc2, iid2, m, observed_at=OBS_AT)
+        review(self.store, o1, "rA", "accept", "甲")
+        a2 = inkseal.analyze(self.store, doc2)
+        kinds2 = defects_by_kind(a2)
+        self.assertIn("time_inversion", kinds2)
+        loc = kinds2["time_inversion"][0]["location"]
+        self.assertEqual(loc["observation"], f"o{o1}")
+        self.assertEqual(loc["material"], f"m{m}")
+        self.assertFalse(a2["conclusion"]["definitive"])
+
+    def test_calibration_mismatch_instrument_and_band(self):
+        doc = self._doc_with_req()
+        ink, seal, _ = layers(self.store, doc)
+        iid = intersection(self.store, doc, ink, seal)
+        m1, _ = material(self.store, doc, seed="photo-A",
+                         instrument="VSC-80", band="660nm")
+        cal = {"instrument": "MS-200", "valid_until": "2026-12-31T00:00:00Z"}
+        o1 = observe_mat(self.store, doc, iid, m1, reviewer="rA",
+                         calibration=cal, conditions={"band": "525nm"})
+        review(self.store, o1, "rA", "accept", "甲")
+        a = inkseal.analyze(self.store, doc)
+        kinds = defects_by_kind(a)
+        self.assertIn("calibration_mismatch", kinds)
+        msg = kinds["calibration_mismatch"][0]["message"]
+        self.assertIn("VSC-80", msg)
+        self.assertIn("525nm", msg)
+        loc = kinds["calibration_mismatch"][0]["location"]
+        self.assertEqual(loc["observation"], f"o{o1}")
+        self.assertEqual(loc["material"], f"m{m1}")
+        self.assertFalse(a["conclusion"]["definitive"])
+        # 仪器与波段一致时无缺陷
+        doc2 = self._doc_with_req()
+        ink2, seal2, _ = layers(self.store, doc2)
+        iid2 = intersection(self.store, doc2, ink2, seal2)
+        m2, _ = material(self.store, doc2, seed="photo-B", band="660nm")
+        o2 = observe_mat(self.store, doc2, iid2, m2, reviewer="rA",
+                         conditions={"band": "660nm"})
+        review(self.store, o2, "rA", "accept", "甲")
+        a2 = inkseal.analyze(self.store, doc2)
+        self.assertNotIn("calibration_mismatch", defects_by_kind(a2))
+        self.assertTrue(a2["conclusion"]["definitive"], a2["defects"])
+
+    def test_cross_modal_requirement(self):
+        # 两个独立来源但同为显微模态 -> 跨模态要求未满足
+        doc = self._doc_with_req(min_independent_sources=2,
+                                 require_cross_modal=True)
+        ink, seal, _ = layers(self.store, doc)
+        iid = intersection(self.store, doc, ink, seal)
+        ma, _ = material(self.store, doc, seed="photo-A")
+        mb, _ = material(self.store, doc, seed="photo-B")
+        o1 = observe_mat(self.store, doc, iid, ma, reviewer="rA")
+        o2 = observe_mat(self.store, doc, iid, mb, reviewer="rB")
+        review(self.store, o1, "rA", "accept", "甲")
+        review(self.store, o2, "rB", "accept", "乙")
+        a = inkseal.analyze(self.store, doc)
+        kinds = defects_by_kind(a)
+        self.assertIn("cross_modal_unmet", kinds)
+        self.assertFalse(a["conclusion"]["definitive"])
+        # 多光谱 + 显微 -> 满足
+        doc2 = self._doc_with_req(min_independent_sources=2,
+                                  require_cross_modal=True)
+        ink2, seal2, _ = layers(self.store, doc2)
+        iid2 = intersection(self.store, doc2, ink2, seal2)
+        mc, _ = material(self.store, doc2, seed="photo-C")
+        md, _ = material(self.store, doc2, seed="photo-D")
+        o3 = observe_mat(self.store, doc2, iid2, mc, reviewer="rA")
+        o4 = observe_mat(self.store, doc2, iid2, md, reviewer="rB",
+                         modality="multispectral")
+        review(self.store, o3, "rA", "accept", "甲")
+        review(self.store, o4, "rB", "accept", "乙")
+        a2 = inkseal.analyze(self.store, doc2)
+        self.assertTrue(a2["conclusion"]["definitive"], a2["defects"])
+        self.assertEqual(a2["edges"][0]["corroborated_by"], 2)
+
+    def test_legacy_unbound_observations_keep_old_rule(self):
+        """未绑定素材的历史观察：各自仍是独立来源，按观察计数。"""
+        doc = self._doc_with_req(min_independent_sources=2)
+        ink, seal, _ = layers(self.store, doc)
+        iid = intersection(self.store, doc, ink, seal)
+        o1 = observe(self.store, doc, iid, reviewer="rA")
+        o2 = observe(self.store, doc, iid, strength=4, reviewer="rB")
+        review(self.store, o1, "rA", "accept", "甲")
+        review(self.store, o2, "rB", "accept", "乙")
+        a = inkseal.analyze(self.store, doc)
+        self.assertTrue(a["conclusion"]["definitive"], a["defects"])
+        edge = a["edges"][0]
+        self.assertEqual(edge["corroborated_by"], 2)
+        self.assertEqual(edge["sources"], ["s1", "s2"])
+        self.assertTrue(all(s["legacy"] for s in a["lineage"]["sources"]))
+        obs = {o["id"]: o for o in a["observations"]}
+        self.assertIsNone(obs[f"o{o1}"]["material"])
+        self.assertEqual(obs[f"o{o1}"]["source"], "s1")
+
+    def test_deterministic_recompute_with_lineage(self):
+        doc, *_ = self._two_crop_setup(min_sources=2)
+        a1 = inkseal.analyze(self.store, doc)
+        a2 = inkseal.analyze(self.store, doc)
+        self.assertEqual(inkseal.canon(a1), inkseal.canon(a2))
+
+
+# --------------------------------------------------------------------------- #
+# 谱系：输出携带（修订 / 签结 / 差异 / SVG / 复算）
+# --------------------------------------------------------------------------- #
+
+class LineageOutputTests(StoreFixture):
+    def _setup(self, min_sources=1):
+        doc = inkseal.create_document(self.store, {
+            "summary": "谱系输出案", "reviewers": REVIEWERS,
+            "canvas": {"w": 1000, "h": 1400},
+            "requirements": {"min_independent_sources": min_sources,
+                             "require_cross_modal": False}})
+        ink, seal, _ = layers(self.store, doc)
+        iid = intersection(self.store, doc, ink, seal)
+        b1 = batch(self.store, doc)
+        m1, _ = material(self.store, doc, seed="photo-A", batch_id=b1)
+        m2, _ = material(self.store, doc, kind="derived", parent=m1,
+                         processing={"sharpen": 1.1})
+        o1 = observe_mat(self.store, doc, iid, m1, reviewer="rA")
+        o2 = observe_mat(self.store, doc, iid, m2, reviewer="rB")
+        review(self.store, o1, "rA", "accept", "甲采纳原件")
+        review(self.store, o2, "rB", "accept", "乙采纳锐化件")
+        return doc, ink, seal, iid, b1, (m1, m2), (o1, o2)
+
+    def test_revision_payloads_carry_lineage(self):
+        doc, ink, seal, iid, b1, (m1, m2), (o1, o2) = self._setup()
+        revs = self.store.revisions(doc)
+        p1 = json.loads(revs[0]["payload"])
+        self.assertEqual(p1["material"], f"m{m1}")
+        self.assertEqual(p1["source"], "s1")
+        p2 = json.loads(revs[1]["payload"])
+        self.assertEqual(p2["material"], f"m{m2}")
+        self.assertEqual(p2["source"], "s1")  # 锐化件与原件同源
+        # 裁决载荷携带各观察的来源归属
+        o3 = observe_mat(self.store, doc, iid, m1, direction="seal_first",
+                         reviewer="rB")
+        adjudicate(self.store, iid, "rA", [o1, o2], "裁断：维持 ink_first")
+        payload = json.loads(self.store.revisions(doc)[-1]["payload"])
+        self.assertEqual(payload["observation_sources"][f"o{o1}"], "s1")
+        self.assertEqual(payload["observation_sources"][f"o{o3}"], "s1")
+
+    def test_signoff_diff_svg_recompute_carry_lineage(self):
+        doc, ink, seal, iid, b1, (m1, m2), (o1, o2) = self._setup()
+        a = inkseal.analyze(self.store, doc)
+        # 复算 JSON：谱系、去重结果与规则同在
+        self.assertEqual(a["lineage"]["requirements"]["min_independent_sources"], 1)
+        self.assertEqual(len(a["lineage"]["sources"]), 1)
+        self.assertIn("lineage", a["recompute"]["rules"])
+        self.assertIn("duplicate_digest",
+                      a["recompute"]["rules"]["blocking_defects"])
+        # 签结快照携带谱系摘要与完整谱系
+        v1, snap = inkseal.signoff(self.store, doc, "谱系签结")
+        self.assertEqual(snap["lineage"]["sources"], 1)
+        self.assertEqual(snap["lineage"]["materials"], 2)
+        self.assertEqual(snap["lineage"]["batches"], 1)
+        self.assertEqual(len(snap["analysis"]["lineage"]["sources"]), 1)
+        self.assertEqual(inkseal.canon(snap["analysis"]), inkseal.canon(a))
+        # SVG 携带谱系与规则摘要
+        svg = inkseal.render_svg(a)
+        self.assertIn("independent sources: 1", svg)
+        self.assertIn("materials: 2", svg)
+        # 新增素材后签结 v2：差异报告谱系变化
+        m3, _ = material(self.store, doc, seed="photo-B")
+        o3 = observe_mat(self.store, doc, iid, m3, reviewer="rA", strength=4)
+        review(self.store, o3, "rA", "accept", "第二独立原件")
+        v2, snap2 = inkseal.signoff(self.store, doc, "第二来源")
+        d = inkseal.version_diff(snap, snap2)
+        self.assertEqual(d["materials_added"], [f"m{m3}"])
+        self.assertEqual(d["materials_removed"], [])
+        self.assertEqual(d["sources_from"], 1)
+        self.assertEqual(d["sources_to"], 2)
+        self.assertTrue(d["material_changed"])
+
+    def test_frozen_rules_replay_for_old_versions(self):
+        doc, *_ = self._setup()
+        v1, snap1 = inkseal.signoff(self.store, doc, "v1")
+        frozen_digest = snap1["rules"]["digest"]
+        frozen_analysis = inkseal.canon(snap1["analysis"])
+        inkseal.RULES["edge_min_strength"] = 3
+        try:
+            v2, snap2 = inkseal.signoff(self.store, doc, "v2")
+            self.assertNotEqual(snap2["rules"]["digest"], frozen_digest)
+            # 旧版本仍按冻结旧规则还原
+            row = self.store.get_version(v1)
+            restored = json.loads(row["snapshot"])
+            self.assertEqual(restored["rules"]["digest"], frozen_digest)
+            self.assertEqual(restored["rules"]["body"]["edge_min_strength"], 4)
+            self.assertEqual(inkseal.canon(restored["analysis"]), frozen_analysis)
+        finally:
+            inkseal.RULES["edge_min_strength"] = 4
+
+    def test_version_diff_without_lineage_section(self):
+        """冻结旧规则的历史快照没有 lineage 段：差异按空谱系处理。"""
+        doc, ink, seal, iid, b1, (m1, m2), (o1, o2) = self._setup()
+        _, snap_new = inkseal.signoff(self.store, doc, "新")
+        legacy_snap = {
+            "analysis": {k: v for k, v in snap_new["analysis"].items()
+                         if k != "lineage"},
+            "material": snap_new["material"],
+            "rules": snap_new["rules"],
+            "decisions": snap_new["decisions"],
+        }
+        d = inkseal.version_diff(legacy_snap, snap_new)
+        self.assertEqual(d["sources_from"], 0)
+        self.assertEqual(d["sources_to"], 1)
+        self.assertEqual(d["materials_added"], [f"m{m1}", f"m{m2}"])
+
+
+# --------------------------------------------------------------------------- #
 # HTTP 端到端
 # --------------------------------------------------------------------------- #
 
@@ -1271,6 +1855,80 @@ class HttpTests(unittest.TestCase):
         _, rec = self._req("GET", f"/api/versions/{v['version']}/recompute")
         self.assertEqual(rec["cycles"], a["cycles"])
         self.assertEqual(rec["defects"], a["defects"])
+
+    def test_lineage_workflow_over_http(self):
+        st, r = self._req("POST", "/api/documents", {
+            "summary": "谱系 HTTP 案", "reviewers": REVIEWERS,
+            "canvas": {"w": 1000, "h": 1400},
+            "requirements": {"min_independent_sources": 2,
+                             "require_cross_modal": False}}, 201)
+        doc = r["document"]
+        _, d = self._req("GET", f"/api/documents/{doc}")
+        self.assertEqual(d["requirements"]["min_independent_sources"], 2)
+        _, r = self._req("POST", f"/api/documents/{doc}/layers",
+                         {"name": "墨", "kind": "ink"}, 201)
+        ink = r["layer"]
+        _, r = self._req("POST", f"/api/documents/{doc}/layers",
+                         {"name": "印", "kind": "seal"}, 201)
+        seal = r["layer"]
+        _, r = self._req("POST", f"/api/documents/{doc}/intersections", {
+            "layer_ids": [ink, seal], "coordinate": {"x": 100, "y": 100}}, 201)
+        i1 = r["intersection"]
+        _, r = self._req("POST", f"/api/documents/{doc}/intersections", {
+            "layer_ids": [ink, seal], "coordinate": {"x": 300, "y": 300}}, 201)
+        i2 = r["intersection"]
+        # 采集批次 + 一张照片 + 两块裁剪截图
+        _, r = self._req("POST", f"/api/documents/{doc}/batches",
+                         {"label": "首轮送检", "operator": "丁"}, 201)
+        b1 = r["batch"]
+        _, r = self._req("POST", f"/api/documents/{doc}/materials", {
+            "kind": "original", "sha256": sha("http-photo"),
+            "instrument": "MS-200", "acquired_at": "2026-09-01T09:00:00Z",
+            "band": "visible", "batch": b1}, 201)
+        photo = r["material"]
+        self.assertIsNone(r["dangling_parent"])
+        crops = []
+        for x in (0, 200):
+            _, r = self._req("POST", f"/api/documents/{doc}/materials", {
+                "kind": "derived", "sha256": sha(f"http-crop-{x}"),
+                "acquired_at": "2026-09-02T09:00:00Z", "parent": photo,
+                "processing": {"crop": True},
+                "crop": {"x": x, "y": 0, "w": 100, "h": 100}}, 201)
+            crops.append(r["material"])
+        # 两块截图各支撑一处观察
+        for idx, (iid, mat) in enumerate(zip((i1, i2), crops)):
+            who = "rA" if idx == 0 else "rB"
+            _, r = self._req("POST", f"/api/documents/{doc}/observations", {
+                "intersection": iid, "direction": "ink_first", "strength": 5,
+                "reviewer": who, "modality": "microscopy",
+                "observed_at": OBS_AT, "calibration": CAL_OK,
+                "material": mat,
+                "region": {"x": 10, "y": 10, "w": 40, "h": 40}}, 201)
+            self.assertEqual(r["material"], mat)
+            self._req("POST", f"/api/observations/{r['observation']}/reviews",
+                      {"reviewer": who, "decision": "accept",
+                       "rationale": f"观察{idx}可采"}, 201)
+        _, a = self._req("GET", f"/api/documents/{doc}/analysis")
+        # 同一照片的两块截图只算一个独立来源 -> 不满足 min_independent_sources=2
+        self.assertEqual(a["edges"][0]["corroborated_by"], 1)
+        self.assertFalse(a["conclusion"]["definitive"])
+        self.assertIn("insufficient_sources",
+                      {d["kind"] for d in a["defects"]})
+        # 谱系一览端点
+        _, lin = self._req("GET", f"/api/documents/{doc}/materials")
+        self.assertEqual(len(lin["batches"]), 1)
+        self.assertEqual(len(lin["materials"]), 3)
+        self.assertEqual(len(lin["sources"]), 1)
+        # 签结与复算携带谱系与规则
+        _, v = self._req("POST", f"/api/documents/{doc}/signoff",
+                         {"note": "谱系 v1"}, 201)
+        _, snap = self._req("GET", f"/api/versions/{v['version']}")
+        self.assertEqual(snap["snapshot"]["lineage"]["sources"], 1)
+        _, rec = self._req("GET", f"/api/versions/{v['version']}/recompute")
+        self.assertEqual(rec["lineage"]["sources"][0]["originals"], [photo])
+        self.assertIn("lineage", rec["recompute"]["rules"])
+        _, svg = self._req("GET", f"/api/documents/{doc}/svg")
+        self.assertIn("independent sources: 1", svg)
 
     def test_health(self):
         _, r = self._req("GET", "/api/health")

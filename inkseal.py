@@ -12,17 +12,26 @@
 交叉点 intersection: 墨水对象与印章对象在纸面上的同一坐标位置
 观察 observation  : 一名标注者在交叉点上的一次显微 / 多光谱观察，
                     给出方向（ink_first / seal_first）与 1-5 的证据强度
+采集批次 batch    : 一次送检 / 采集会话登记的一组素材
+素材 material     : 原始照片 / 扫描件（original）或由其派生的处理件
+                    （derived：锐化、伪彩、缩放、裁剪……），记录文件
+                    SHA-256、仪器、采集时刻、波段、父素材、处理参数与裁剪范围
+独立来源 source   : 沿父子链与相同 SHA-256 归并后的同源分量；
+                    未绑定素材的历史观察各自构成一个 legacy 来源（冻结旧规则）
 
 推断模型
 --------
 每条「采纳」的观察变成一条带证据强度的有向边 pred -> succ
 （ink_first：ink -> seal；seal_first：seal -> ink）。
-同一对图层身份的边跨交叉点合并取最强证据，强度 >= edge_min_strength 才成立。
+同一对图层身份的边跨交叉点合并取最强证据，强度 >= edge_min_strength 才成立；
+边的 corroborated_by 按见证观察背后的独立来源（原件）计数，
+同一张照片的裁剪 / 锐化 / 伪彩 / 缩放派生物只算一个来源。
 在有向图上求可达偏序：可比对、不可比对、节点数最少的矛盾环。
 
-下列任一情况存在，结果 definitive=false，并把缺陷定位回原始观察：
+下列任一情况存在，结果 definitive=false，并把缺陷定位回原始观察与素材路径：
 坐标越界 / 图层错绑 / 校准失效 / 同点观察冲突 / 证据链断裂 /
-审查未完成或有异议 / 推断成环。
+审查未完成或有异议 / 推断成环 / 摘要重复 / 循环派生 / 裁剪重叠 /
+时间倒置 / 校准错配 / 独立来源不足 / 跨模态要求未满足。
 """
 
 import argparse
@@ -44,6 +53,10 @@ VALID_LAYER_KINDS = ("ink", "seal", "other")
 VALID_REVIEW_DECISIONS = ("accept", "exclude")
 VALID_MODALITIES = ("microscopy", "multispectral", "other")
 DECISION_REVISIONS = ("review", "adjudicate")
+VALID_MATERIAL_KINDS = ("original", "derived")
+
+# 文档级谱系要求的缺省值：单来源即可成立、不强制跨模态（与旧行为一致）。
+DEFAULT_REQUIREMENTS = {"min_independent_sources": 1, "require_cross_modal": False}
 
 # 签结时被冻结的规则集。任何改动都会改变 rules_digest，旧版本仍可复算。
 RULES = {
@@ -76,6 +89,29 @@ RULES = {
         "unanimous_among_submitted": True,
         "dispute_resolution": "adjudication",
     },
+    "lineage": {
+        "source": "independent source = connected component of materials over "
+                  "parent links and identical sha256, anchored at root originals",
+        "unbound_observation": "an observation without material binding is its own "
+                               "independent source (frozen legacy rule)",
+        "corroborated_by": "count of distinct independent sources behind an "
+                           "edge's witnesses",
+        "duplicate_digest": "one sha256 shared by materials that are not in a "
+                            "single derivation chain",
+        "crop_overlap": "derived siblings of one parent with intersecting crop "
+                        "rectangles, both used by effective observations",
+        "time_inversion": "derived material acquired before its parent, or an "
+                          "observation earlier than its material's acquisition",
+        "calibration_mismatch": "observation calibration.instrument or "
+                                "conditions.band disagrees with the bound "
+                                "material's instrument/band",
+    },
+    "document_requirements": {
+        "min_independent_sources": "each established edge needs at least N "
+                                   "independent sources (default 1)",
+        "require_cross_modal": "each established edge's witnesses must span at "
+                               "least 2 modalities (default false)",
+    },
     "blocking_defects": [
         "out_of_bounds",
         "layer_misbind",
@@ -85,6 +121,13 @@ RULES = {
         "review_pending",
         "review_dispute",
         "contradiction_cycle",
+        "duplicate_digest",
+        "derivation_cycle",
+        "crop_overlap",
+        "time_inversion",
+        "calibration_mismatch",
+        "insufficient_sources",
+        "cross_modal_unmet",
     ],
 }
 
@@ -147,6 +190,7 @@ CREATE TABLE IF NOT EXISTS documents (
     reviewers      TEXT NOT NULL,   -- JSON: [{id,name}]，两名审查者
     examiner       TEXT,            -- 采集 / 送检说明
     canvas         TEXT,            -- JSON: {w,h}
+    requirements   TEXT,            -- JSON: {min_independent_sources, require_cross_modal}
     created_at     TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS layers (
@@ -176,6 +220,32 @@ CREATE TABLE IF NOT EXISTS observations (
     observed_at    TEXT NOT NULL,
     conditions     TEXT,            -- JSON: 采集条件
     calibration    TEXT,            -- JSON: 仪器校准 {instrument,valid_until,details}
+    material_id    INTEGER,         -- 绑定素材（可空：历史观察走冻结旧规则）
+    region         TEXT,            -- JSON: 素材上的取证区域 {x,y,w,h}
+    created_at     TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS batches (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id    INTEGER NOT NULL REFERENCES documents(id),
+    label          TEXT NOT NULL,
+    operator       TEXT,
+    note           TEXT,
+    created_at     TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS materials (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id    INTEGER NOT NULL REFERENCES documents(id),
+    batch_id       INTEGER REFERENCES batches(id),
+    kind           TEXT NOT NULL,   -- original | derived
+    sha256         TEXT NOT NULL,   -- 文件摘要（64 位小写十六进制）
+    instrument     TEXT,
+    acquired_at    TEXT NOT NULL,   -- 采集时刻 ISO-8601 UTC
+    band           TEXT,            -- 波段（如 visible / 660nm / UV365）
+    parent_id      INTEGER,         -- 父素材；故意不加外键：悬空引用允许录入，
+                                    -- 由分析阶段暴露 broken_chain
+    processing     TEXT,            -- JSON: 处理参数（锐化 / 伪彩 / 缩放……）
+    crop           TEXT,            -- JSON: 父素材坐标系中的裁剪范围 {x,y,w,h}
+    note           TEXT,
     created_at     TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS reviews (
@@ -221,7 +291,21 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self):
+        """既有库增补谱系列（新库由 SCHEMA 建全，此处为空操作）。"""
+        obs_cols = {r["name"] for r in
+                    self.execute("PRAGMA table_info(observations)")}
+        if "material_id" not in obs_cols:
+            self.execute("ALTER TABLE observations ADD COLUMN material_id INTEGER")
+        if "region" not in obs_cols:
+            self.execute("ALTER TABLE observations ADD COLUMN region TEXT")
+        doc_cols = {r["name"] for r in
+                    self.execute("PRAGMA table_info(documents)")}
+        if "requirements" not in doc_cols:
+            self.execute("ALTER TABLE documents ADD COLUMN requirements TEXT")
 
     def execute(self, sql, args=()):
         return self.conn.execute(sql, args)
@@ -250,6 +334,16 @@ class Store:
     def observations(self, doc_id):
         return self.execute(
             "SELECT * FROM observations WHERE document_id=? ORDER BY id", (doc_id,)
+        ).fetchall()
+
+    def batches(self, doc_id):
+        return self.execute(
+            "SELECT * FROM batches WHERE document_id=? ORDER BY id", (doc_id,)
+        ).fetchall()
+
+    def materials(self, doc_id):
+        return self.execute(
+            "SELECT * FROM materials WHERE document_id=? ORDER BY id", (doc_id,)
         ).fetchall()
 
     def reviews_for(self, observation_ids):
@@ -342,6 +436,37 @@ def check_calibration(cal, observed_at):
     except ValueError as exc:
         return f"unparsable calibration timestamp: {exc}"
     return None
+
+
+def check_sha256(value):
+    """文件摘要必须是 64 位十六进制（录入时归一为小写）。"""
+    if not isinstance(value, str):
+        return "sha256 must be a hex string"
+    v = value.strip().lower()
+    if len(v) != 64 or any(c not in "0123456789abcdef" for c in v):
+        return "sha256 must be 64 hex characters"
+    return None
+
+
+def check_region(region, what="region"):
+    """取证区域 / 裁剪范围必须是非零面积的 {x,y,w,h}。"""
+    if not isinstance(region, dict) or not all(k in region for k in ("x", "y", "w", "h")):
+        return f"{what} must be {{x,y,w,h}}"
+    x, y, w, h = (region[k] for k in ("x", "y", "w", "h"))
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+               for v in (x, y, w, h)):
+        return f"{what} x/y/w/h must be numbers"
+    if x < 0 or y < 0:
+        return f"{what} x/y must be >= 0"
+    if w <= 0 or h <= 0:
+        return f"{what} w/h must be > 0"
+    return None
+
+
+def rects_overlap(a, b):
+    """两个 {x,y,w,h} 矩形是否存在正面积交集（仅贴边不算重叠）。"""
+    return (a["x"] < b["x"] + b["w"] and b["x"] < a["x"] + a["w"]
+            and a["y"] < b["y"] + b["h"] and b["y"] < a["y"] + a["h"])
 
 
 # --------------------------------------------------------------------------- #
@@ -520,6 +645,197 @@ def _j(row, key):
     return json.loads(value) if value is not None else None
 
 
+def document_requirements(doc):
+    """文档锁定的谱系要求（缺省回退 DEFAULT_REQUIREMENTS）。"""
+    req = dict(DEFAULT_REQUIREMENTS)
+    stored = _j(doc, "requirements")
+    if isinstance(stored, dict):
+        for k in req:
+            if k in stored:
+                req[k] = stored[k]
+    return req
+
+
+def _is_ancestor(anc, node, parent_of):
+    """anc 是否为 node 沿父链的祖先。"""
+    seen = set()
+    cur = parent_of.get(node)
+    while cur is not None and cur not in seen:
+        if cur == anc:
+            return True
+        seen.add(cur)
+        cur = parent_of.get(cur)
+    return False
+
+
+def resolve_lineage(materials, observations):
+    """沿父子链与相同摘要归并同源素材，划分独立来源。
+
+    独立来源 = 父引用与相同 SHA-256 构成的连通分量，由根原件锚定；
+    未绑定素材的观察各自构成一个 legacy 伪来源（冻结旧规则：按观察计数）。
+    同时识别摘要重复、循环派生、悬空父引用（链路断裂）与素材级时间倒置。
+    返回来源列表、映射与材料级缺陷；全部按确定顺序输出。
+    """
+    mat_by_id = {m["id"]: m for m in materials}
+    parent_of = {}   # 仅存在的父引用；悬空引用单独登记
+    dangling = {}
+    for m in materials:
+        pid = m["parent_id"]
+        if pid is None:
+            continue
+        if pid in mat_by_id:
+            parent_of[m["id"]] = pid
+        else:
+            dangling[m["id"]] = pid
+
+    # 素材路径：从自身沿父链到根（或断裂 / 成环处为止）
+    paths = {}
+    for m in materials:
+        chain, node, seen = [], m["id"], set()
+        while node in mat_by_id and node not in seen:
+            seen.add(node)
+            chain.append(ref("m", node))
+            node = parent_of.get(node)
+        paths[m["id"]] = chain
+
+    # 循环派生：沿父链回访到本路径上的节点即成环
+    cycle_sets = set()
+    for m in materials:
+        seen, path, node = {}, [], m["id"]
+        while node in parent_of and node not in seen:
+            seen[node] = len(path)
+            path.append(node)
+            node = parent_of[node]
+        if node in seen:
+            cycle_sets.add(frozenset(path[seen[node]:]))
+    cyclic = set().union(*cycle_sets) if cycle_sets else set()
+
+    # 连通分量（父链 ∪ 同摘要）；并查集以小 id 为根保证确定性
+    dsu = {m["id"]: m["id"] for m in materials}
+
+    def find(x):
+        while dsu[x] != x:
+            dsu[x] = dsu[dsu[x]]
+            x = dsu[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            dsu[max(ra, rb)] = min(ra, rb)
+
+    for child, parent in parent_of.items():
+        union(child, parent)
+    by_digest = defaultdict(list)
+    for m in materials:
+        by_digest[m["sha256"]].append(m["id"])
+    for ids in by_digest.values():
+        for other in ids[1:]:
+            union(ids[0], other)
+
+    comps = defaultdict(list)
+    for m in materials:
+        comps[find(m["id"])].append(m["id"])
+    ordered = sorted(comps.values(), key=lambda ids: min(ids))
+
+    mat_to_source = {}
+    sources = []
+    broken_mats = set()
+    for num, ids in enumerate(ordered, 1):
+        members = sorted(ids)
+        originals = [i for i in members if mat_by_id[i]["kind"] == "original"]
+        broken = (any(i in dangling for i in members)
+                  or any(i in cyclic for i in members)
+                  or not originals)
+        if broken:
+            broken_mats.update(members)
+        for i in members:
+            mat_to_source[i] = num
+        sources.append({
+            "id": ref("s", num),
+            "materials": [ref("m", i) for i in members],
+            "originals": [ref("m", i) for i in originals],
+            "sha256": sorted({mat_by_id[i]["sha256"] for i in members}),
+            "observations": [],
+            "cyclic": any(i in cyclic for i in members),
+            "broken": broken,
+            "legacy": False,
+        })
+
+    obs_to_source = {}
+    for o in sorted(observations, key=lambda x: x["id"]):
+        mid = o["material_id"]
+        if mid is not None and mid in mat_to_source:
+            num = mat_to_source[mid]
+            obs_to_source[o["id"]] = num
+            sources[num - 1]["observations"].append(ref("o", o["id"]))
+        else:
+            num = len(sources) + 1
+            obs_to_source[o["id"]] = num
+            sources.append({
+                "id": ref("s", num), "materials": [], "originals": [],
+                "sha256": [], "observations": [ref("o", o["id"])],
+                "cyclic": False, "broken": False, "legacy": True,
+            })
+
+    defects = []
+    # 摘要重复：同一 SHA-256 落在非单一派生链的素材之间（重复送审）
+    for sha, ids in sorted(by_digest.items()):
+        if len(ids) < 2:
+            continue
+        ids = sorted(ids)
+        one_chain = all(
+            _is_ancestor(a, b, parent_of) or _is_ancestor(b, a, parent_of)
+            for x, a in enumerate(ids) for b in ids[x + 1:])
+        if not one_chain:
+            defects.append({
+                "kind": "duplicate_digest",
+                "message": (f"sha256 {sha[:16]}... shared by "
+                            f"{', '.join(ref('m', i) for i in ids)} outside a "
+                            "single derivation chain: duplicate submission, "
+                            "counts as one source"),
+                "location": {"materials": [ref("m", i) for i in ids],
+                             "material_paths": [paths[i] for i in ids]}})
+    # 循环派生：无法锚定根原件
+    for cyc in sorted(cycle_sets, key=lambda c: min(c)):
+        members = sorted(cyc)
+        defects.append({
+            "kind": "derivation_cycle",
+            "message": (f"circular derivation among "
+                        f"{', '.join(ref('m', i) for i in members)}: "
+                        "no root original can be established"),
+            "location": {"materials": [ref("m", i) for i in members],
+                         "material_paths": [paths[i] for i in members]}})
+    # 链路断裂：父引用悬空
+    for mid, pid in sorted(dangling.items()):
+        defects.append({
+            "kind": "broken_chain",
+            "message": (f"material m{mid} declares missing parent m{pid}: "
+                        "lineage chain broken"),
+            "location": {"materials": [ref("m", mid)],
+                         "material_path": paths[mid]}})
+    # 素材级时间倒置：派生物早于其父素材采集
+    for child, parent in sorted(parent_of.items()):
+        ca = mat_by_id[child]["acquired_at"]
+        pa = mat_by_id[parent]["acquired_at"]
+        if parse_iso(ca) < parse_iso(pa):
+            defects.append({
+                "kind": "time_inversion",
+                "message": (f"derived material m{child} acquired at {ca} "
+                            f"before its parent m{parent} acquired at {pa}"),
+                "location": {"materials": [ref("m", child), ref("m", parent)],
+                             "material_path": paths[child]}})
+
+    return {
+        "sources": sources,
+        "mat_to_source": mat_to_source,
+        "obs_to_source": obs_to_source,
+        "broken_mats": broken_mats,
+        "paths": paths,
+        "defects": defects,
+    }
+
+
 def effective_review_state(obs_id, reviews_by_obs, forced):
     """返回 (state, reasons)。
 
@@ -544,13 +860,15 @@ def effective_review_state(obs_id, reviews_by_obs, forced):
     ]
 
 
-def build_material(store, doc, layers, intersections, observations):
+def build_material(store, doc, layers, intersections, observations,
+                   batches, materials):
     """被 material_digest 锁定的事实素材（不含审查决定）。"""
     return {
         "api": API_VERSION,
         "summary": doc["summary"],
         "examiner": doc["examiner"],
         "canvas": _j(doc, "canvas"),
+        "requirements": _j(doc, "requirements"),
         "layers": sorted(
             ([l["id"], l["name"], l["kind"], l["description"]] for l in layers),
             key=lambda x: x[0],
@@ -560,10 +878,21 @@ def build_material(store, doc, layers, intersections, observations):
               _j(i, "canvas"), i["note"]] for i in intersections),
             key=lambda x: x[0],
         ),
+        "batches": sorted(
+            ([b["id"], b["label"], b["operator"], b["note"]] for b in batches),
+            key=lambda x: x[0],
+        ),
+        "materials": sorted(
+            ([m["id"], m["batch_id"], m["kind"], m["sha256"], m["instrument"],
+              m["acquired_at"], m["band"], m["parent_id"], _j(m, "processing"),
+              _j(m, "crop"), m["note"]] for m in materials),
+            key=lambda x: x[0],
+        ),
         "observations": sorted(
             ([o["id"], o["intersection_id"], o["direction"], o["strength"],
               o["reviewer"], o["modality"], o["observed_at"],
-              _j(o, "conditions"), _j(o, "calibration")] for o in observations),
+              _j(o, "conditions"), _j(o, "calibration"),
+              o["material_id"], _j(o, "region")] for o in observations),
             key=lambda x: x[0],
         ),
     }
@@ -592,6 +921,9 @@ def analyze(store, doc_id):
     intersections = store.intersections(doc_id)
     observations = store.observations(doc_id)
     revisions = store.revisions(doc_id)
+    batches = store.batches(doc_id)
+    materials = store.materials(doc_id)
+    requirements = document_requirements(doc)
     reviews = [r for rows in store.reviews_for([o["id"] for o in observations]).values()
                for r in rows]
     reviewer_ids = [r["id"] for r in _j(doc, "reviewers")]
@@ -599,6 +931,10 @@ def analyze(store, doc_id):
 
     layer_by_id = {l["id"]: l for l in layers}
     ix_by_id = {i["id"]: i for i in intersections}
+    mat_by_id = {m["id"]: m for m in materials}
+
+    # -- 谱系归并：同源分量 = 独立来源；材料级缺陷先行登记 ------------------ #
+    lineage = resolve_lineage(materials, observations)
 
     # -- 裁决派生的强制结论（同一观察以最后一次裁决为准） -------------------- #
     forced = {}
@@ -612,7 +948,7 @@ def analyze(store, doc_id):
 
     reviews_by_obs = store.reviews_for([o["id"] for o in observations])
 
-    defects = []
+    defects = list(lineage["defects"])  # 谱系材料级缺陷（已带素材路径定位）
 
     def add_defect(kind, message, obs_id=None, ix_id=None):
         loc = {}
@@ -672,6 +1008,10 @@ def analyze(store, doc_id):
             "observed_at": o["observed_at"],
             "conditions": _j(o, "conditions"),
             "calibration": _j(o, "calibration"),
+            "material": ref("m", o["material_id"])
+                        if o["material_id"] is not None else None,
+            "region": _j(o, "region"),
+            "source": ref("s", lineage["obs_to_source"][o["id"]]),
             "state": state,
             "state_reasons": reasons,
             "factual_defects": [],
@@ -695,6 +1035,41 @@ def analyze(store, doc_id):
                 view["factual_defects"].append("calibration_invalid")
                 add_defect("calibration_invalid", f"o{o['id']}: {msg_cal}",
                            obs_id=o["id"], ix_id=ix["id"])
+        # -- 谱系事实缺陷（仅绑定素材的观察；未绑定者走冻结旧规则） ---------- #
+        mid = o["material_id"]
+        if mid is not None and mid in mat_by_id:
+            m = mat_by_id[mid]
+            m_loc = {"observation": ref("o", o["id"]),
+                     "intersection": ref("i", o["intersection_id"]),
+                     "material": ref("m", mid),
+                     "material_path": lineage["paths"][mid]}
+            if mid in lineage["broken_mats"]:
+                view["factual_defects"].append(
+                    "broken_chain:material lineage broken")
+            if parse_iso(o["observed_at"]) < parse_iso(m["acquired_at"]):
+                view["factual_defects"].append("time_inversion")
+                defects.append({
+                    "kind": "time_inversion",
+                    "message": (f"o{o['id']} observed at {o['observed_at']} "
+                                f"before material m{mid} was acquired at "
+                                f"{m['acquired_at']}"),
+                    "location": dict(m_loc)})
+            cal = _j(o, "calibration") or {}
+            mismatches = []
+            inst = cal.get("instrument")
+            if inst and m["instrument"] and inst != m["instrument"]:
+                mismatches.append(f"calibration instrument '{inst}' != material "
+                                  f"instrument '{m['instrument']}'")
+            band = (_j(o, "conditions") or {}).get("band")
+            if band is not None and m["band"] and str(band) != str(m["band"]):
+                mismatches.append(f"observation band '{band}' != material "
+                                  f"band '{m['band']}'")
+            if mismatches:
+                view["factual_defects"].append("calibration_mismatch")
+                defects.append({
+                    "kind": "calibration_mismatch",
+                    "message": f"o{o['id']} vs m{mid}: " + "; ".join(mismatches),
+                    "location": dict(m_loc)})
         if state == "pending":
             add_defect("review_pending",
                        f"o{o['id']} has no review yet", obs_id=o["id"],
@@ -707,6 +1082,35 @@ def analyze(store, doc_id):
             active_ids.add(o["id"])
         obs_view.append(view)
 
+    # -- 裁剪重叠：同一父素材的派生裁剪区域相交，且都被有效观察使用 -------- #
+    # 同一张照片裁出的两个「交叉区域」若共享像素，相同像素被当成两处独立取证。
+    active_mats = {o["material_id"] for o in observations
+                   if o["id"] in active_ids and o["material_id"] is not None}
+    kids_by_parent = defaultdict(list)
+    for m in materials:
+        if m["parent_id"] in mat_by_id and _j(m, "crop"):
+            kids_by_parent[m["parent_id"]].append(m)
+    for pid, kids in sorted(kids_by_parent.items()):
+        in_use = [k for k in kids if k["id"] in active_mats]
+        for x in range(len(in_use)):
+            for y in range(x + 1, len(in_use)):
+                a, b = in_use[x], in_use[y]
+                if not rects_overlap(_j(a, "crop"), _j(b, "crop")):
+                    continue
+                obs_ab = sorted(ref("o", o["id"]) for o in observations
+                                if o["material_id"] in (a["id"], b["id"]))
+                defects.append({
+                    "kind": "crop_overlap",
+                    "message": (f"m{a['id']} and m{b['id']} crop overlapping "
+                                f"regions of parent m{pid}: the same pixels "
+                                "are presented as distinct forensic regions"),
+                    "location": {
+                        "materials": [ref("m", a["id"]), ref("m", b["id"])],
+                        "parent": ref("m", pid),
+                        "material_paths": [lineage["paths"][a["id"]],
+                                           lineage["paths"][b["id"]]],
+                        "observations": obs_ab}})
+
     # -- 同交叉点合并 + 冲突检测（仅对参与推断的有效观察） ------------------ #
     groups = defaultdict(list)
     for o in observations:
@@ -714,7 +1118,8 @@ def analyze(store, doc_id):
             groups[o["intersection_id"]].append(o)
 
     conflicted_obs = set()
-    merged_edges = defaultdict(lambda: {"witnesses": [], "intersections": set()})
+    merged_edges = defaultdict(lambda: {"witnesses": [], "intersections": set(),
+                                        "sources": set()})
 
     for ix_id, obs_list in groups.items():
         dirs = {o["direction"] for o in obs_list}
@@ -747,14 +1152,20 @@ def analyze(store, doc_id):
             else:
                 pred, succ = seal, ink
             slot = merged_edges[(pred, succ)]
+            src = lineage["obs_to_source"].get(o["id"])
             slot["witnesses"].append({
                 "observation": ref("o", o["id"]),
                 "intersection": ref("i", ix_id),
                 "reviewer": o["reviewer"],
                 "strength": o["strength"],
                 "modality": o["modality"],
+                "material": ref("m", o["material_id"])
+                            if o["material_id"] is not None else None,
+                "source": ref("s", src) if src is not None else None,
             })
             slot["intersections"].add(ix_id)
+            if src is not None:
+                slot["sources"].add(src)
 
     # 强度 >= 阈值才成立为图边；否则构成“证据链断裂”：
     # 已采纳的观察不足以单独建立先后关系，且没有其他交叉点补强。
@@ -762,11 +1173,13 @@ def analyze(store, doc_id):
     rejected_edges = []
     for (pred, succ), slot in sorted(merged_edges.items(), key=lambda kv: kv[0]):
         strength = max(w["strength"] for w in slot["witnesses"])
+        srcs = sorted(slot["sources"])
         edge = {
             "from": ref("l", pred),
             "to": ref("l", succ),
             "strength": strength,
-            "corroborated_by": len(slot["witnesses"]),
+            "corroborated_by": len(srcs),
+            "sources": [ref("s", s) for s in srcs],
             "intersections": sorted(ref("i", i) for i in slot["intersections"]),
             "witnesses": sorted(slot["witnesses"], key=lambda w: w["observation"]),
             "established": strength >= EDGE_MIN_STRENGTH,
@@ -788,6 +1201,31 @@ def analyze(store, doc_id):
                     "observations": obs_refs,
                 },
             })
+
+    # -- 文档级谱系要求：最少独立来源数 / 跨模态（仅约束已成立的边） -------- #
+    for edge in edges:
+        obs_refs = [w["observation"] for w in edge["witnesses"]]
+        loc = {"intersections": edge["intersections"],
+               "observations": obs_refs,
+               "sources": edge["sources"]}
+        if len(edge["sources"]) < requirements["min_independent_sources"]:
+            defects.append({
+                "kind": "insufficient_sources",
+                "message": (f"{edge['from']} before {edge['to']} rests on "
+                            f"{len(edge['sources'])} independent source(s) "
+                            f"({', '.join(edge['sources'])}), below document "
+                            f"min_independent_sources="
+                            f"{requirements['min_independent_sources']}"),
+                "location": dict(loc)})
+        if requirements["require_cross_modal"]:
+            mods = sorted({w["modality"] for w in edge["witnesses"]})
+            if len(mods) < 2:
+                defects.append({
+                    "kind": "cross_modal_unmet",
+                    "message": (f"{edge['from']} before {edge['to']} is "
+                                f"supported only by modality {mods}; document "
+                                "requires cross-modal evidence"),
+                    "location": dict(loc)})
 
     # -- 图：SCC / 环 / 可达 ---------------------------------------------- #
     node_ids = sorted(layer_by_id.keys())
@@ -899,7 +1337,8 @@ def analyze(store, doc_id):
         l = layer_by_id[lid]
         return {"id": ref("l", lid), "name": l["name"], "kind": l["kind"]}
 
-    material = build_material(store, doc, layers, intersections, observations)
+    material = build_material(store, doc, layers, intersections, observations,
+                              batches, materials)
     decisions = build_decisions(reviews, revisions)
     mdig = digest(material)
     ddig = digest(decisions)
@@ -939,6 +1378,28 @@ def analyze(store, doc_id):
             for ix in intersections
         ],
         "observations": obs_view,
+        "lineage": {
+            "requirements": requirements,
+            "batches": [{"id": ref("b", b["id"]), "label": b["label"],
+                         "operator": b["operator"], "note": b["note"],
+                         "created_at": b["created_at"]} for b in batches],
+            "materials": [{
+                "id": ref("m", m["id"]),
+                "batch": ref("b", m["batch_id"]) if m["batch_id"] else None,
+                "kind": m["kind"],
+                "sha256": m["sha256"],
+                "instrument": m["instrument"],
+                "acquired_at": m["acquired_at"],
+                "band": m["band"],
+                "parent": ref("m", m["parent_id"]) if m["parent_id"] else None,
+                "processing": _j(m, "processing"),
+                "crop": _j(m, "crop"),
+                "source": ref("s", lineage["mat_to_source"][m["id"]]),
+                "path": lineage["paths"][m["id"]],
+                "note": m["note"],
+            } for m in materials],
+            "sources": lineage["sources"],
+        },
         "defects": defects,
         "recompute": {
             "material_digest": mdig,
@@ -968,6 +1429,12 @@ def signoff(store, doc_id, note):
             "analysis": analysis,
             "material": {
                 "digest": analysis["recompute"]["material_digest"],
+            },
+            "lineage": {
+                "sources": len(analysis["lineage"]["sources"]),
+                "materials": len(analysis["lineage"]["materials"]),
+                "batches": len(analysis["lineage"]["batches"]),
+                "requirements": analysis["lineage"]["requirements"],
             },
             "rules": {
                 "digest": analysis["recompute"]["rules_digest"],
@@ -1020,6 +1487,12 @@ def version_diff(snap_a, snap_b):
     added_i = sorted(set(ib) - set(ia))
     removed_i = sorted(set(ia) - set(ib))
 
+    # 谱系：旧快照可能没有 lineage 段（冻结旧规则），按空谱系处理
+    la = an.get("lineage") or {"materials": [], "sources": []}
+    lb = bn.get("lineage") or {"materials": [], "sources": []}
+    mats_a = {m["id"] for m in la["materials"]}
+    mats_b = {m["id"] for m in lb["materials"]}
+
     ea = {(e["from"], e["to"]): e for e in an["edges"]}
     eb = {(e["from"], e["to"]): e for e in bn["edges"]}
     edges_added = sorted(set(eb) - set(ea))
@@ -1046,6 +1519,10 @@ def version_diff(snap_a, snap_b):
         "observations_added": added_o,
         "observations_removed": removed_o,
         "observations_changed": changed_o,
+        "materials_added": sorted(mats_b - mats_a),
+        "materials_removed": sorted(mats_a - mats_b),
+        "sources_from": len(la["sources"]),
+        "sources_to": len(lb["sources"]),
         "edges_added": [{"from": a, "to": b} for a, b in edges_added],
         "edges_removed": [{"from": a, "to": b} for a, b in edges_removed],
         "order_added": [{"earlier": a, "later": b} for a, b in sorted(pb - pa)],
@@ -1146,6 +1623,14 @@ def render_svg(analysis):
     status = ("DETERMINED" if analysis["conclusion"]["definitive"]
               else f'INCONCLUSIVE — {analysis["conclusion"]["blocking_defect_count"]} '
                    "blocking defect(s)")
+    lineage = analysis.get("lineage")
+    if lineage:
+        parts.append(
+            f'<text x="12" y="{height - 30}" font-size="11" fill="#666">'
+            f'independent sources: {len(lineage["sources"])} · '
+            f'materials: {len(lineage["materials"])} · '
+            f'batches: {len(lineage["batches"])} · '
+            f'rules {analysis["recompute"]["rules_digest"][:12]}</text>')
     parts.append(
         f'<text x="12" y="{height - 12}" font-size="12" '
         f'fill="{"#1e7d32" if analysis["conclusion"]["definitive"] else "#c0392b"}">'
@@ -1180,13 +1665,30 @@ def create_document(store, body):
     canvas = body.get("canvas")
     if canvas is not None and (not all(k in canvas for k in ("w", "h"))):
         raise HttpError(400, "bad_canvas", "canvas must be {w,h}")
+    requirements = body.get("requirements")
+    if requirements is not None:
+        if not isinstance(requirements, dict):
+            raise HttpError(400, "bad_requirements",
+                            "requirements must be an object")
+        mis = requirements.get("min_independent_sources", 1)
+        rcm = requirements.get("require_cross_modal", False)
+        if not isinstance(mis, int) or isinstance(mis, bool) or mis < 1:
+            raise HttpError(422, "bad_requirements",
+                            "min_independent_sources must be an integer >= 1")
+        if not isinstance(rcm, bool):
+            raise HttpError(422, "bad_requirements",
+                            "require_cross_modal must be a boolean")
+        requirements = {"min_independent_sources": mis,
+                        "require_cross_modal": rcm}
     with store.lock:
         cur = store.execute(
-            "INSERT INTO documents(summary,reviewers,examiner,canvas,created_at) "
-            "VALUES(?,?,?,?,?)",
+            "INSERT INTO documents(summary,reviewers,examiner,canvas,requirements,"
+            "created_at) VALUES(?,?,?,?,?,?)",
             (summary, json.dumps(normalized, ensure_ascii=False),
              body.get("examiner"),
-             json.dumps(canvas) if canvas else None, now_iso()))
+             json.dumps(canvas) if canvas else None,
+             json.dumps(requirements, ensure_ascii=False)
+             if requirements is not None else None, now_iso()))
         store.commit()
         return cur.lastrowid
 
@@ -1224,6 +1726,83 @@ def add_intersection(store, doc_id, body):
         return cur.lastrowid, unknown
 
 
+def add_batch(store, doc_id, body):
+    store.get_document(doc_id)
+    label = require(body, "label", str)
+    if not label.strip():
+        raise HttpError(422, "bad_label", "batch label must be non-blank")
+    with store.lock:
+        cur = store.execute(
+            "INSERT INTO batches(document_id,label,operator,note,created_at) "
+            "VALUES(?,?,?,?,?)",
+            (doc_id, label.strip(), body.get("operator"), body.get("note"),
+             now_iso()))
+        store.commit()
+        return cur.lastrowid
+
+
+def add_material(store, doc_id, body):
+    """登记原始 / 派生素材。悬空父引用允许录入，由分析阶段暴露 broken_chain。"""
+    store.get_document(doc_id)
+    kind = require(body, "kind", str)
+    if kind not in VALID_MATERIAL_KINDS:
+        raise HttpError(422, "bad_kind",
+                        f"kind must be one of {VALID_MATERIAL_KINDS}")
+    sha = require(body, "sha256")
+    msg = check_sha256(sha)
+    if msg:
+        raise HttpError(422, "bad_sha256", msg)
+    sha_norm = sha.strip().lower()
+    acquired_at = require(body, "acquired_at", str)
+    try:
+        parse_iso(acquired_at)
+    except ValueError as exc:
+        raise HttpError(422, "bad_timestamp", str(exc))
+    batch_id = None
+    if body.get("batch") is not None:
+        batch_id = parse_ref(body["batch"], "b")
+        row = store.execute(
+            "SELECT id FROM batches WHERE id=? AND document_id=?",
+            (batch_id, doc_id)).fetchone()
+        if not row:
+            raise HttpError(404, "not_found",
+                            f"batch b{batch_id} not found in document d{doc_id}")
+    parent_id = None
+    dangling = None
+    if kind == "derived":
+        parent_ref = require(body, "parent", str)
+        parent_id = parse_ref(parent_ref, "m")
+        row = store.execute(
+            "SELECT id FROM materials WHERE id=? AND document_id=?",
+            (parent_id, doc_id)).fetchone()
+        if not row:
+            dangling = parent_id
+    elif body.get("parent") is not None:
+        raise HttpError(422, "bad_parent",
+                        "original material must not declare a parent")
+    processing = body.get("processing")
+    if processing is not None and not isinstance(processing, dict):
+        raise HttpError(422, "bad_processing", "processing must be an object")
+    crop = body.get("crop")
+    if crop is not None:
+        msg = check_region(crop, "crop")
+        if msg:
+            raise HttpError(422, "bad_crop", msg)
+    with store.lock:
+        cur = store.execute(
+            "INSERT INTO materials(document_id,batch_id,kind,sha256,instrument,"
+            "acquired_at,band,parent_id,processing,crop,note,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (doc_id, batch_id, kind, sha_norm, body.get("instrument"),
+             acquired_at, body.get("band"), parent_id,
+             json.dumps(processing, ensure_ascii=False)
+             if processing is not None else None,
+             json.dumps(crop, ensure_ascii=False) if crop is not None else None,
+             body.get("note"), now_iso()))
+        store.commit()
+        return cur.lastrowid, dangling
+
+
 def add_observation(store, doc_id, body):
     doc = store.get_document(doc_id)
     ix_ref = require(body, "intersection", str)
@@ -1255,17 +1834,37 @@ def add_observation(store, doc_id, body):
             parse_iso(cal["valid_until"])
         except ValueError as exc:
             raise HttpError(422, "bad_timestamp", str(exc))
+    # 观察须指向素材及取证区域；未绑定素材的历史观察保持旧规则
+    material_id = None
+    region = body.get("region")
+    if body.get("material") is not None:
+        material_id = parse_ref(body["material"], "m")
+        mrow = store.execute(
+            "SELECT id FROM materials WHERE id=? AND document_id=?",
+            (material_id, doc_id)).fetchone()
+        if not mrow:
+            raise HttpError(404, "not_found",
+                            f"material m{material_id} not found in document "
+                            f"d{doc_id}")
+        region = require(body, "region", dict)
+        msg = check_region(region)
+        if msg:
+            raise HttpError(422, "bad_region", msg)
+    elif region is not None:
+        raise HttpError(422, "bad_region", "region requires a bound material")
     known_reviewers = {r["id"] for r in _j(doc, "reviewers")}
     external = reviewer not in known_reviewers
     with store.lock:
         cur = store.execute(
             "INSERT INTO observations(document_id,intersection_id,direction,strength,"
-            "reviewer,modality,observed_at,conditions,calibration,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "reviewer,modality,observed_at,conditions,calibration,material_id,"
+            "region,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (doc_id, ix_id, direction, strength, reviewer, modality, observed_at,
              json.dumps(body.get("conditions"), ensure_ascii=False)
              if body.get("conditions") is not None else None,
              json.dumps(cal, ensure_ascii=False) if cal is not None else None,
+             material_id,
+             json.dumps(region, ensure_ascii=False) if region is not None else None,
              now_iso()))
         store.commit()
         return cur.lastrowid, external
@@ -1307,9 +1906,16 @@ def add_review(store, obs_id, body):
             "INSERT INTO reviews(observation_id,reviewer,decision,rationale,created_at)"
             " VALUES(?,?,?,?,?)",
             (obs_id, reviewer, decision, rationale, now_iso()))
+        # 谱系上下文随审查冻结：当时观察绑定的素材与独立来源
+        lin = resolve_lineage(store.materials(obs["document_id"]),
+                              store.observations(obs["document_id"]))
+        src = lin["obs_to_source"].get(obs_id)
         seq = store.add_revision(
             obs["document_id"], "review", "observation", obs_id, reviewer, rationale,
-            {"decision": decision, "review_id": cur.lastrowid})
+            {"decision": decision, "review_id": cur.lastrowid,
+             "material": ref("m", obs["material_id"])
+                         if obs["material_id"] is not None else None,
+             "source": ref("s", src) if src is not None else None})
         store.commit()
         return seq
 
@@ -1341,11 +1947,17 @@ def adjudicate(store, ix_id, body):
                         "all accepted observations must share one direction")
     excluded_ids = [oid for oid in row_by_id if oid not in accepted_ids]
     with store.lock:
+        # 谱系上下文随裁决冻结：交叉点各观察当时的独立来源归属
+        lin = resolve_lineage(store.materials(ix["document_id"]),
+                              store.observations(ix["document_id"]))
         payload = {
             "intersection": ref("i", ix_id),
             "winning_direction": next(iter(directions), None),
             "accepted_observations": accepted_ids,
             "excluded_observations": excluded_ids,
+            "observation_sources": {
+                ref("o", oid): ref("s", lin["obs_to_source"][oid])
+                for oid in row_by_id},
         }
         seq = store.add_revision(
             ix["document_id"], "adjudicate", "intersection", ix_id,
@@ -1364,16 +1976,24 @@ INDEX_HTML = """<!doctype html><meta charset=utf-8>
 <h1>InkSeal</h1><p>朱墨时序（书写 / 盖章先后）鉴识服务 · 仅 Python 标准库</p>
 <h2>端点</h2>
 <pre>
-POST /api/documents                       建文档 {summary, reviewers:[2], canvas?}
+POST /api/documents                       建文档 {summary, reviewers:[2], canvas?,
+                                          requirements?{min_independent_sources,
+                                          require_cross_modal}}
 GET  /api/documents/{d}                   文档状态 + 当前复算
 POST /api/documents/{d}/layers            加图层 {name, kind:ink|seal|other}
 POST /api/documents/{d}/intersections     加交叉点 {layer_ids, coordinate:{x,y}}
+POST /api/documents/{d}/batches           登记采集批次 {label, operator?, note?}
+POST /api/documents/{d}/materials         登记素材 {kind:original|derived, sha256,
+                                          acquired_at, batch?, instrument?, band?,
+                                          parent?(derived 必填), processing?, crop?}
+GET  /api/documents/{d}/materials         谱系一览（批次 / 素材 / 独立来源）
 POST /api/documents/{d}/observations      加观察 {intersection, direction,
                                               strength 1-5, reviewer, modality,
-                                              observed_at, calibration{...}}
+                                              observed_at, calibration{...},
+                                              material?, region?{x,y,w,h}}
 POST /api/observations/{o}/reviews        审查 {reviewer, decision, rationale}
 POST /api/intersections/{i}/adjudicate    裁决 {arbiter, accepted_observations, rationale}
-GET  /api/documents/{d}/analysis          确定性复算 JSON
+GET  /api/documents/{d}/analysis          确定性复算 JSON（含谱系与去重结果）
 GET  /api/documents/{d}/svg               当前顺序图 SVG
 POST /api/documents/{d}/signoff           签结 {note?}
 GET  /api/documents/{d}/versions          版本列表
@@ -1458,11 +2078,26 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(201, {
                             "intersection": ref("i", iid),
                             "unknown_layers": [ref("l", u) for u in unknown]})
-                    if method == "POST" and resource == "observations":
-                        oid, external = add_observation(
+                    if method == "POST" and resource == "batches":
+                        bid = add_batch(self.store, doc_id, self._body())
+                        return self._send(201, {"batch": ref("b", bid)})
+                    if method == "POST" and resource == "materials":
+                        mid, dangling = add_material(
                             self.store, doc_id, self._body())
                         return self._send(201, {
+                            "material": ref("m", mid),
+                            "dangling_parent": ref("m", dangling)
+                                               if dangling else None})
+                    if method == "GET" and resource == "materials":
+                        return self._send(
+                            200, analyze(self.store, doc_id)["lineage"])
+                    if method == "POST" and resource == "observations":
+                        body = self._body()
+                        oid, external = add_observation(
+                            self.store, doc_id, body)
+                        return self._send(201, {
                             "observation": ref("o", oid),
+                            "material": body.get("material"),
                             "external_reviewer": external,
                             "state": "pending" if external else "pending_review"})
                     if method == "POST" and resource == "signoff":
@@ -1561,6 +2196,7 @@ class Handler(BaseHTTPRequestHandler):
             "reviewers": _j(doc, "reviewers"),
             "examiner": doc["examiner"],
             "canvas": _j(doc, "canvas"),
+            "requirements": document_requirements(doc),
             "created_at": doc["created_at"],
             "analysis": analysis,
         })
