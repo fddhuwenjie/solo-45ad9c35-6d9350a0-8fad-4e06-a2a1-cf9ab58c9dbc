@@ -62,13 +62,16 @@ def intersection(store, doc, lid_a, lid_b, x=100, y=100, canvas=None, note=None)
 def observe(store, doc, iid, direction="ink_first", strength=5,
             reviewer="rA", calibration=None, observed_at=OBS_AT,
             modality="microscopy"):
-    oid, _ = inkseal.add_observation(store, doc, {
-        "intersection": f"i{iid}", "direction": direction,
-        "strength": strength, "reviewer": reviewer,
-        "modality": modality, "observed_at": observed_at,
-        "conditions": {"lighting": "同轴反射光"},
-        "calibration": CAL_OK if calibration is None else calibration})
-    return oid
+    """公开接口现强制绑定素材：为本次观察登记一份独立原件。
+
+    每份观察各自一个原件 -> 各自一个独立来源，印证计数与旧
+    「未绑定观察按观察计数」的语义一致，既有断言不受影响。
+    """
+    mid, _ = material(store, doc)
+    return observe_mat(store, doc, iid, mid, direction=direction,
+                       strength=strength, reviewer=reviewer,
+                       modality=modality, observed_at=observed_at,
+                       calibration=CAL_OK if calibration is None else calibration)
 
 
 def review(store, oid, reviewer="rA", decision="accept", rationale="理由"):
@@ -554,22 +557,28 @@ class ValidationTests(StoreFixture):
         doc = new_doc(self.store)
         ink, seal, _ = layers(self.store, doc)
         iid = intersection(self.store, doc, ink, seal)
+        m1, _ = material(self.store, doc)
         with self.assertRaises(inkseal.HttpError) as cm:
             inkseal.add_observation(self.store, doc, {
                 "intersection": f"i{iid}", "direction": "sideways",
                 "strength": 5, "reviewer": "rA", "modality": "microscopy",
-                "observed_at": OBS_AT, "calibration": CAL_OK})
+                "observed_at": OBS_AT, "calibration": CAL_OK,
+                "material": f"m{m1}",
+                "region": {"x": 1, "y": 1, "w": 5, "h": 5}})
         self.assertEqual(cm.exception.status, 422)
 
     def test_bad_strength(self):
         doc = new_doc(self.store)
         ink, seal, _ = layers(self.store, doc)
         iid = intersection(self.store, doc, ink, seal)
+        m1, _ = material(self.store, doc)
         with self.assertRaises(inkseal.HttpError):
             inkseal.add_observation(self.store, doc, {
                 "intersection": f"i{iid}", "direction": "ink_first",
                 "strength": 9, "reviewer": "rA", "modality": "microscopy",
-                "observed_at": OBS_AT, "calibration": CAL_OK})
+                "observed_at": OBS_AT, "calibration": CAL_OK,
+                "material": f"m{m1}",
+                "region": {"x": 1, "y": 1, "w": 5, "h": 5}})
 
     def test_unknown_reviewer_cannot_review(self):
         doc = new_doc(self.store)
@@ -1053,22 +1062,16 @@ class LineageRegistrationTests(StoreFixture):
         ink, seal, _ = layers(self.store, doc)
         iid = intersection(self.store, doc, ink, seal)
         m1, _ = material(self.store, doc, seed="photo-A")
-        # 绑定素材必须同时给取证区域
-        with self.assertRaises(inkseal.HttpError) as cm:
-            inkseal.add_observation(self.store, doc, {
-                "intersection": f"i{iid}", "direction": "ink_first",
+        base = {"intersection": f"i{iid}", "direction": "ink_first",
                 "strength": 5, "reviewer": "rA", "modality": "microscopy",
-                "observed_at": OBS_AT, "calibration": CAL_OK,
-                "material": f"m{m1}"})
-        self.assertEqual(cm.exception.code, "missing_field")
-        # 未绑定素材不得给区域
-        with self.assertRaises(inkseal.HttpError) as cm:
-            inkseal.add_observation(self.store, doc, {
-                "intersection": f"i{iid}", "direction": "ink_first",
-                "strength": 5, "reviewer": "rA", "modality": "microscopy",
-                "observed_at": OBS_AT, "calibration": CAL_OK,
-                "region": {"x": 1, "y": 1, "w": 5, "h": 5}})
-        self.assertEqual(cm.exception.code, "bad_region")
+                "observed_at": OBS_AT, "calibration": CAL_OK}
+        # 素材与区域缺一不可：两者都省略、只给区域、只给素材均被拒绝
+        for extra in ({},
+                      {"region": {"x": 1, "y": 1, "w": 5, "h": 5}},
+                      {"material": f"m{m1}"}):
+            with self.assertRaises(inkseal.HttpError) as cm:
+                inkseal.add_observation(self.store, doc, dict(base, **extra))
+            self.assertEqual(cm.exception.code, "missing_field", extra)
         # 未知素材 404；区域形状错误 422
         with self.assertRaises(inkseal.HttpError) as cm:
             observe_mat(self.store, doc, iid, 999)
@@ -1355,23 +1358,63 @@ class LineageAnalysisTests(StoreFixture):
         self.assertEqual(a2["edges"][0]["corroborated_by"], 2)
 
     def test_legacy_unbound_observations_keep_old_rule(self):
-        """未绑定素材的历史观察：各自仍是独立来源，按观察计数。"""
+        """数据库中既有的未绑定历史观察：各自仍是 legacy 独立来源。
+
+        公开接口已强制绑定素材；此类记录只能来自谱系强制前的旧库，
+        这里直接写库模拟，分析仍按冻结旧规则以观察计数。
+        """
         doc = self._doc_with_req(min_independent_sources=2)
         ink, seal, _ = layers(self.store, doc)
         iid = intersection(self.store, doc, ink, seal)
-        o1 = observe(self.store, doc, iid, reviewer="rA")
-        o2 = observe(self.store, doc, iid, strength=4, reviewer="rB")
-        review(self.store, o1, "rA", "accept", "甲")
-        review(self.store, o2, "rB", "accept", "乙")
+        obs = []
+        for who, strength in (("rA", 5), ("rB", 4)):
+            cur = self.store.execute(
+                "INSERT INTO observations(document_id,intersection_id,direction,"
+                "strength,reviewer,modality,observed_at,conditions,calibration,"
+                "material_id,region,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (doc, iid, "ink_first", strength, who, "microscopy", OBS_AT,
+                 json.dumps({"lighting": "同轴反射光"}, ensure_ascii=False),
+                 json.dumps(CAL_OK, ensure_ascii=False), None, None,
+                 inkseal.now_iso()))
+            obs.append(cur.lastrowid)
+        self.store.commit()
+        review(self.store, obs[0], "rA", "accept", "甲")
+        review(self.store, obs[1], "rB", "accept", "乙")
         a = inkseal.analyze(self.store, doc)
         self.assertTrue(a["conclusion"]["definitive"], a["defects"])
         edge = a["edges"][0]
         self.assertEqual(edge["corroborated_by"], 2)
         self.assertEqual(edge["sources"], ["s1", "s2"])
         self.assertTrue(all(s["legacy"] for s in a["lineage"]["sources"]))
-        obs = {o["id"]: o for o in a["observations"]}
-        self.assertIsNone(obs[f"o{o1}"]["material"])
-        self.assertEqual(obs[f"o{o1}"]["source"], "s1")
+        obs_view = {o["id"]: o for o in a["observations"]}
+        self.assertIsNone(obs_view[f"o{obs[0]}"]["material"])
+        self.assertEqual(obs_view[f"o{obs[0]}"]["source"], "s1")
+
+    def test_unbound_observation_cannot_bypass_source_threshold(self):
+        """回归：省略 material/region 的新观察被拒绝，来源门槛不可绕过。"""
+        doc, ink, seal, photo, crops, obs = self._two_crop_setup(min_sources=2)
+        a = inkseal.analyze(self.store, doc)
+        self.assertEqual(a["edges"][0]["corroborated_by"], 1)
+        self.assertFalse(a["conclusion"]["definitive"])
+        iid = self.store.intersections(doc)[0]["id"]
+        base = {"intersection": f"i{iid}", "direction": "ink_first",
+                "strength": 5, "reviewer": "rA", "modality": "microscopy",
+                "observed_at": OBS_AT, "calibration": CAL_OK}
+        # 旧缺陷下，这样的观察会变成一个 legacy 独立来源使计数 1 -> 2
+        for extra in ({},
+                      {"region": {"x": 1, "y": 1, "w": 5, "h": 5}},
+                      {"material": f"m{photo}"}):
+            with self.assertRaises(inkseal.HttpError) as cm:
+                inkseal.add_observation(self.store, doc, dict(base, **extra))
+            self.assertEqual(cm.exception.code, "missing_field", extra)
+        # 拒绝未写入：观察数、来源数与 inconclusive 结论均不变
+        a2 = inkseal.analyze(self.store, doc)
+        self.assertEqual(len(a2["observations"]), 2)
+        self.assertEqual(len(a2["lineage"]["sources"]), 1)
+        self.assertEqual(a2["edges"][0]["corroborated_by"], 1)
+        self.assertFalse(a2["conclusion"]["definitive"])
+        self.assertIn("insufficient_sources", defects_by_kind(a2))
 
     def test_deterministic_recompute_with_lineage(self):
         doc, *_ = self._two_crop_setup(min_sources=2)
@@ -1543,12 +1586,22 @@ class HttpTests(unittest.TestCase):
         _, r = self._req("POST", f"/api/documents/{doc}/intersections", {
             "layer_ids": [ink, seal], "coordinate": {"x": 120, "y": 240}}, 201)
         iid = r["intersection"]
+        _, r = self._req("POST", f"/api/documents/{doc}/materials", {
+            "kind": "original", "sha256": sha("http-wf-1"),
+            "instrument": "MS-200", "acquired_at": "2026-09-01T09:00:00Z",
+            "band": "660nm"}, 201)
+        m1 = r["material"]
+        _, r = self._req("POST", f"/api/documents/{doc}/materials", {
+            "kind": "original", "sha256": sha("http-wf-2"),
+            "instrument": "MS-200", "acquired_at": "2026-09-01T09:00:00Z"}, 201)
+        m2 = r["material"]
         _, r = self._req("POST", f"/api/documents/{doc}/observations", {
             "intersection": iid, "direction": "seal_first", "strength": 5,
             "reviewer": "rA", "modality": "multispectral",
             "observed_at": OBS_AT,
             "conditions": {"band": "660nm"},
-            "calibration": CAL_OK}, 201)
+            "calibration": CAL_OK,
+            "material": m1, "region": {"x": 5, "y": 5, "w": 20, "h": 20}}, 201)
         o1 = r["observation"]
         self._req("POST", f"/api/observations/{o1}/reviews",
                   {"reviewer": "rA", "decision": "accept",
@@ -1557,7 +1610,8 @@ class HttpTests(unittest.TestCase):
         _, r = self._req("POST", f"/api/documents/{doc}/observations", {
             "intersection": iid, "direction": "seal_first", "strength": 4,
             "reviewer": "rB", "modality": "microscopy",
-            "observed_at": OBS_AT, "calibration": CAL_OK}, 201)
+            "observed_at": OBS_AT, "calibration": CAL_OK,
+            "material": m2, "region": {"x": 8, "y": 8, "w": 20, "h": 20}}, 201)
         o2 = r["observation"]
         self._req("POST", f"/api/observations/{o2}/reviews",
                   {"reviewer": "rB", "decision": "accept",
@@ -1600,15 +1654,25 @@ class HttpTests(unittest.TestCase):
                          {"layer_ids": [ink, seal],
                           "coordinate": {"x": 10, "y": 10}}, 201)
         iid = r["intersection"]
+        _, r = self._req("POST", f"/api/documents/{doc}/materials", {
+            "kind": "original", "sha256": sha("http-conflict-1"),
+            "instrument": "MS-200", "acquired_at": "2026-09-01T09:00:00Z"}, 201)
+        m1 = r["material"]
+        _, r = self._req("POST", f"/api/documents/{doc}/materials", {
+            "kind": "original", "sha256": sha("http-conflict-2"),
+            "instrument": "MS-200", "acquired_at": "2026-09-01T09:00:00Z"}, 201)
+        m2 = r["material"]
         _, r = self._req("POST", f"/api/documents/{doc}/observations", {
             "intersection": iid, "direction": "ink_first", "strength": 5,
             "reviewer": "rA", "modality": "microscopy",
-            "observed_at": OBS_AT, "calibration": CAL_OK}, 201)
+            "observed_at": OBS_AT, "calibration": CAL_OK,
+            "material": m1, "region": {"x": 1, "y": 1, "w": 5, "h": 5}}, 201)
         o1 = r["observation"]
         _, r = self._req("POST", f"/api/documents/{doc}/observations", {
             "intersection": iid, "direction": "seal_first", "strength": 5,
             "reviewer": "rB", "modality": "multispectral",
-            "observed_at": OBS_AT, "calibration": CAL_OK}, 201)
+            "observed_at": OBS_AT, "calibration": CAL_OK,
+            "material": m2, "region": {"x": 2, "y": 2, "w": 5, "h": 5}}, 201)
         o2 = r["observation"]
         self._req("POST", f"/api/observations/{o1}/reviews",
                   {"reviewer": "rA", "decision": "accept", "rationale": "甲"}, 201)
@@ -1669,10 +1733,15 @@ class HttpTests(unittest.TestCase):
                          {"layer_ids": [ink, seal],
                           "coordinate": {"x": 10, "y": 10}}, 201)
         iid = r["intersection"]
+        _, r = self._req("POST", f"/api/documents/{doc}/materials", {
+            "kind": "original", "sha256": sha("http-blank"),
+            "instrument": "MS-200", "acquired_at": "2026-09-01T09:00:00Z"}, 201)
+        m1 = r["material"]
         _, r = self._req("POST", f"/api/documents/{doc}/observations", {
             "intersection": iid, "direction": "ink_first", "strength": 5,
             "reviewer": "rA", "modality": "microscopy",
-            "observed_at": OBS_AT, "calibration": CAL_OK}, 201)
+            "observed_at": OBS_AT, "calibration": CAL_OK,
+            "material": m1, "region": {"x": 1, "y": 1, "w": 5, "h": 5}}, 201)
         o1 = r["observation"]
         for blank in ("", "   ", " \t "):
             st, r = self._req("POST", f"/api/observations/{o1}/reviews",
@@ -1710,6 +1779,10 @@ class HttpTests(unittest.TestCase):
             ("墨二", "印二", "seal_first"),  # 绕行长环边
             ("墨二", "印一", "ink_first"),   # 绕行长环边
         ]
+        _, r = self._req("POST", f"/api/documents/{doc}/materials", {
+            "kind": "original", "sha256": sha("http-cyc"),
+            "instrument": "MS-200", "acquired_at": "2026-09-01T09:00:00Z"}, 201)
+        m1 = r["material"]
         short_obs = []
         for idx, (a_name, b_name, direction) in enumerate(specs):
             _, r = self._req("POST", f"/api/documents/{doc}/intersections", {
@@ -1720,7 +1793,9 @@ class HttpTests(unittest.TestCase):
             _, r = self._req("POST", f"/api/documents/{doc}/observations", {
                 "intersection": iid, "direction": direction, "strength": 5,
                 "reviewer": who, "modality": "microscopy",
-                "observed_at": OBS_AT, "calibration": CAL_OK}, 201)
+                "observed_at": OBS_AT, "calibration": CAL_OK,
+                "material": m1,
+                "region": {"x": idx, "y": 0, "w": 5, "h": 5}}, 201)
             oid = r["observation"]
             self._req("POST", f"/api/observations/{oid}/reviews",
                       {"reviewer": who, "decision": "accept",
@@ -1770,6 +1845,10 @@ class HttpTests(unittest.TestCase):
                     edge_specs.append((a, b))
         edge_specs += [(l27, l28), (l28, l27)]
         self.assertEqual(len(edge_specs), 112)
+        _, r = self._req("POST", f"/api/documents/{doc}/materials", {
+            "kind": "original", "sha256": sha("http-28layer"),
+            "instrument": "MS-200", "acquired_at": "2026-09-01T09:00:00Z"}, 201)
+        m1 = r["material"]
         short_obs = []
         for idx, (a, b) in enumerate(edge_specs):
             _, r = self._req("POST", f"/api/documents/{doc}/intersections",
@@ -1781,7 +1860,9 @@ class HttpTests(unittest.TestCase):
             _, r = self._req("POST", f"/api/documents/{doc}/observations", {
                 "intersection": iid, "direction": direction, "strength": 5,
                 "reviewer": who, "modality": "microscopy",
-                "observed_at": OBS_AT, "calibration": CAL_OK}, 201)
+                "observed_at": OBS_AT, "calibration": CAL_OK,
+                "material": m1,
+                "region": {"x": idx % 100, "y": 0, "w": 5, "h": 5}}, 201)
             oid = r["observation"]
             self._req("POST", f"/api/observations/{oid}/reviews",
                       {"reviewer": who, "decision": "accept",
@@ -1825,6 +1906,10 @@ class HttpTests(unittest.TestCase):
                 for b in groups[(i + 1) % 6]:
                     edge_specs.append((a, b))
         self.assertEqual(len(edge_specs), 110)
+        _, r = self._req("POST", f"/api/documents/{doc}/materials", {
+            "kind": "original", "sha256": sha("http-5625"),
+            "instrument": "MS-200", "acquired_at": "2026-09-01T09:00:00Z"}, 201)
+        m1 = r["material"]
         for idx, (a, b) in enumerate(edge_specs):
             _, r = self._req("POST", f"/api/documents/{doc}/intersections",
                              {"layer_ids": [a, b],
@@ -1835,7 +1920,9 @@ class HttpTests(unittest.TestCase):
             _, r = self._req("POST", f"/api/documents/{doc}/observations", {
                 "intersection": iid, "direction": direction, "strength": 5,
                 "reviewer": who, "modality": "microscopy",
-                "observed_at": OBS_AT, "calibration": CAL_OK}, 201)
+                "observed_at": OBS_AT, "calibration": CAL_OK,
+                "material": m1,
+                "region": {"x": idx % 100, "y": 0, "w": 5, "h": 5}}, 201)
             oid = r["observation"]
             self._req("POST", f"/api/observations/{oid}/reviews",
                       {"reviewer": who, "decision": "accept",
@@ -1914,6 +2001,20 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(a["conclusion"]["definitive"])
         self.assertIn("insufficient_sources",
                       {d["kind"] for d in a["defects"]})
+        # 回归：省略 material 或 region 的观察被公开接口拒绝，门槛不可绕过
+        base = {"intersection": i1, "direction": "ink_first", "strength": 5,
+                "reviewer": "rA", "modality": "microscopy",
+                "observed_at": OBS_AT, "calibration": CAL_OK}
+        for extra in ({},
+                      {"region": {"x": 1, "y": 1, "w": 5, "h": 5}},
+                      {"material": photo}):
+            st, r = self._req("POST", f"/api/documents/{doc}/observations",
+                              dict(base, **extra), 400)
+            self.assertEqual(r["error"], "missing_field", extra)
+        _, a = self._req("GET", f"/api/documents/{doc}/analysis")
+        self.assertEqual(len(a["observations"]), 2)
+        self.assertEqual(a["edges"][0]["corroborated_by"], 1)
+        self.assertFalse(a["conclusion"]["definitive"])
         # 谱系一览端点
         _, lin = self._req("GET", f"/api/documents/{doc}/materials")
         self.assertEqual(len(lin["batches"]), 1)

@@ -11,7 +11,8 @@
 图层对象 layer   : 一页面上的一个对象（墨水笔画 ink / 印泥印章 seal / other）
 交叉点 intersection: 墨水对象与印章对象在纸面上的同一坐标位置
 观察 observation  : 一名标注者在交叉点上的一次显微 / 多光谱观察，
-                    给出方向（ink_first / seal_first）与 1-5 的证据强度
+                    给出方向（ink_first / seal_first）与 1-5 的证据强度；
+                    新观察必须同时指向采集素材与取证区域
 采集批次 batch    : 一次送检 / 采集会话登记的一组素材
 素材 material     : 原始照片 / 扫描件（original）或由其派生的处理件
                     （derived：锐化、伪彩、缩放、裁剪……），记录文件
@@ -1834,24 +1835,22 @@ def add_observation(store, doc_id, body):
             parse_iso(cal["valid_until"])
         except ValueError as exc:
             raise HttpError(422, "bad_timestamp", str(exc))
-    # 观察须指向素材及取证区域；未绑定素材的历史观察保持旧规则
-    material_id = None
-    region = body.get("region")
-    if body.get("material") is not None:
-        material_id = parse_ref(body["material"], "m")
-        mrow = store.execute(
-            "SELECT id FROM materials WHERE id=? AND document_id=?",
-            (material_id, doc_id)).fetchone()
-        if not mrow:
-            raise HttpError(404, "not_found",
-                            f"material m{material_id} not found in document "
-                            f"d{doc_id}")
-        region = require(body, "region", dict)
-        msg = check_region(region)
-        if msg:
-            raise HttpError(422, "bad_region", msg)
-    elif region is not None:
-        raise HttpError(422, "bad_region", "region requires a bound material")
+    # 新观察必须同时指向素材与取证区域，任一缺失即拒绝；
+    # 未绑定素材的观察只存在于既有数据库（谱系强制前的历史记录），
+    # 由分析按冻结旧规则还原，公开接口不再接受。
+    material_ref = require(body, "material", str)
+    material_id = parse_ref(material_ref, "m")
+    mrow = store.execute(
+        "SELECT id FROM materials WHERE id=? AND document_id=?",
+        (material_id, doc_id)).fetchone()
+    if not mrow:
+        raise HttpError(404, "not_found",
+                        f"material m{material_id} not found in document "
+                        f"d{doc_id}")
+    region = require(body, "region", dict)
+    msg = check_region(region)
+    if msg:
+        raise HttpError(422, "bad_region", msg)
     known_reviewers = {r["id"] for r in _j(doc, "reviewers")}
     external = reviewer not in known_reviewers
     with store.lock:
@@ -1990,7 +1989,8 @@ GET  /api/documents/{d}/materials         谱系一览（批次 / 素材 / 独�
 POST /api/documents/{d}/observations      加观察 {intersection, direction,
                                               strength 1-5, reviewer, modality,
                                               observed_at, calibration{...},
-                                              material?, region?{x,y,w,h}}
+                                              material, region:{x,y,w,h}}
+                                              （material 与 region 缺一不可）
 POST /api/observations/{o}/reviews        审查 {reviewer, decision, rationale}
 POST /api/intersections/{i}/adjudicate    裁决 {arbiter, accepted_observations, rationale}
 GET  /api/documents/{d}/analysis          确定性复算 JSON（含谱系与去重结果）

@@ -30,7 +30,9 @@
    所需最少独立来源数，默认 1）与 `require_cross_modal`（边的见证须覆盖
    ≥2 种模态，默认 false）；未满足即 inconclusive 并标出观察与素材路径；
 5. **未绑定素材的历史观察**各自构成一个 legacy 来源，按冻结旧规则
-   以观察计数——旧数据行为不变，旧签结版本仍按其冻结规则复算。
+   以观察计数——旧数据行为不变，旧签结版本仍按其冻结规则复算；
+   公开写入接口不再接受未绑定的新观察（`material` 与 `region` 缺一不可），
+   来源门槛无法靠省略绑定来绕过。
 
 ## 阻断条件（任一存在即不下确定结论）
 
@@ -60,7 +62,7 @@
 
 ```bash
 python3 inkseal.py --db inkseal.db --host 127.0.0.1 --port 8080
-python3 -m unittest test_inkseal -v   # 81 个测试
+python3 -m unittest test_inkseal -v   # 82 个测试
 ```
 
 ## 端点
@@ -84,8 +86,9 @@ POST /api/documents/{d}/observations      {intersection, direction: ink_first|se
                                            strength: 1-5, reviewer, modality,
                                            observed_at, conditions,
                                            calibration:{instrument, valid_until},
-                                           material?, region?{x,y,w,h}}
-                                           （绑定 material 时必须同给 region）
+                                           material, region:{x,y,w,h}}
+                                           （material 与 region 缺一不可，任一缺失 400；
+                                           未绑定的历史记录仍按冻结旧规则还原）
 POST /api/observations/{o}/reviews        {reviewer, decision: accept|exclude, rationale}
 POST /api/intersections/{i}/adjudicate    {arbiter, accepted_observations, rationale}
                                           （rationale 去空白后须非空，否则 422 且不写入）
