@@ -101,6 +101,29 @@ class StoreFixture(unittest.TestCase):
 # 纯算法
 # --------------------------------------------------------------------------- #
 
+def theta28_graph():
+    """28 节点、112 条边：高分支六环组件 + 后置 2-环 (27,28)。
+
+    组件一：6 组 (3,5,5,5,3,5) 共 26 节点，相邻组全连接，110 条边；
+    自身最短环为 6 且多达 5625 个，足以耗尽旧的 500 枚举上限。
+    组件二：27⇄28 二节点环（2 条边），是全图唯一最短环。
+    """
+    sizes = [3, 5, 5, 5, 3, 5]
+    groups, nxt = [], 1
+    for size in sizes:
+        groups.append(list(range(nxt, nxt + size)))
+        nxt += size
+    edges = []
+    for i in range(6):
+        for a in groups[i]:
+            for b in groups[(i + 1) % 6]:
+                edges.append((a, b))
+    edges += [(27, 28), (28, 27)]
+    nodes = list(range(1, 29))
+    assert len(edges) == 112 and len(nodes) == 28
+    return nodes, edges
+
+
 class GraphTests(unittest.TestCase):
     def test_reachability_chain(self):
         nodes = [1, 2, 3]
@@ -133,6 +156,31 @@ class GraphTests(unittest.TestCase):
         self.assertFalse(truncated)
         self.assertEqual(len(rings), 1)
         self.assertEqual(rings[0], [1, 2, 3])
+
+    def test_enumeration_cap_does_not_hide_shorter_cycle(self):
+        # 28 节点 112 边：高分支组件先产出 500 个六环也不得挤掉 27⇄28 二环
+        nodes, edges = theta28_graph()
+        rings, truncated = inkseal.enumerate_simple_cycles(nodes, edges)
+        self.assertFalse(truncated)
+        self.assertEqual(rings, [[27, 28]])
+
+    def test_enumeration_cap_still_bounds_shortest_cycles(self):
+        # 去掉二环后，5625 个六环即最短环：cap 仍截断，但截断的全是最短环
+        nodes, edges = theta28_graph()
+        edges = [e for e in edges if 27 not in e and 28 not in e]
+        rings, truncated = inkseal.enumerate_simple_cycles(nodes, edges)
+        self.assertTrue(truncated)
+        self.assertEqual(len(rings), inkseal.CYCLE_ENUM_CAP)
+        self.assertTrue(all(len(r) == 6 for r in rings))
+
+    def test_cycle_girth(self):
+        from collections import defaultdict
+        nodes, edges = theta28_graph()
+        adj = defaultdict(set)
+        for a, b in edges:
+            adj[a].add(b)
+        self.assertEqual(inkseal.cycle_girth(nodes, adj), 2)
+        self.assertIsNone(inkseal.cycle_girth([1, 2], defaultdict(set)))
 
     def test_bfs_path(self):
         adj = {1: [2], 2: [3], 3: []}
@@ -652,6 +700,73 @@ class ShortestCycleTests(StoreFixture):
 
 
 # --------------------------------------------------------------------------- #
+# 回归：枚举上限不影响全图最短环（28 图层 / 112 边）
+# --------------------------------------------------------------------------- #
+
+class ShortestCycleCapTests(StoreFixture):
+    def _build_28_layer_doc(self):
+        """28 图层、112 条边：高分支六环组件 + 后置 l27⇄l28 二节点环。"""
+        doc = new_doc(self.store)
+        sizes = [3, 5, 5, 5, 3, 5]
+        kinds = ["ink", "seal", "ink", "seal", "ink", "seal"]
+        groups, kind_of = [], {}
+        for gi, (size, kind) in enumerate(zip(sizes, kinds)):
+            group = []
+            for k in range(size):
+                lid = inkseal.add_layer(self.store, doc, {
+                    "name": f"组{gi + 1}对象{k + 1}", "kind": kind})
+                group.append(lid)
+                kind_of[lid] = kind
+            groups.append(group)
+        l27 = inkseal.add_layer(self.store, doc,
+                                {"name": "落款墨迹", "kind": "ink"})
+        l28 = inkseal.add_layer(self.store, doc,
+                                {"name": "印章印文", "kind": "seal"})
+        self.assertEqual((l27, l28), (27, 28))
+        kind_of[l27], kind_of[l28] = "ink", "seal"
+        edge_specs = []
+        for i in range(6):
+            for a in groups[i]:
+                for b in groups[(i + 1) % 6]:
+                    edge_specs.append((a, b))
+        edge_specs += [(l27, l28), (l28, l27)]
+        self.assertEqual(len(edge_specs), 112)
+        obs_by_edge = {}
+        for idx, (a, b) in enumerate(edge_specs):
+            direction = "ink_first" if kind_of[a] == "ink" else "seal_first"
+            iid = intersection(self.store, doc, a, b)
+            who = "rA" if idx % 2 == 0 else "rB"
+            o = observe(self.store, doc, iid, direction=direction, reviewer=who)
+            review(self.store, o, who, "accept", f"边{idx}证据充分")
+            obs_by_edge[(a, b)] = o
+        return doc, obs_by_edge, l27, l28
+
+    def test_shortest_cycle_survives_enumeration_cap(self):
+        doc, obs_by_edge, l27, l28 = self._build_28_layer_doc()
+        a = inkseal.analyze(self.store, doc)
+        self.assertFalse(a["conclusion"]["definitive"])
+        # 全图最短环是后置的 l27⇄l28；六环不得因枚举上限挤占结果
+        self.assertEqual([c["nodes"] for c in a["cycles"]],
+                         [[f"l{l27}", f"l{l28}"]])
+        expect_obs = sorted([f"o{obs_by_edge[(l27, l28)]}",
+                             f"o{obs_by_edge[(l28, l27)]}"])
+        self.assertEqual(a["cycles"][0]["observations"], expect_obs)
+        # 阻断缺陷与同一结果一致：仅一条，精确定位短环，无截断提示
+        self.assertEqual(a["conclusion"]["blocking_defect_count"], 1)
+        cyc = defects_by_kind(a)["contradiction_cycle"]
+        self.assertEqual(len(cyc), 1)
+        self.assertEqual(cyc[0]["message"],
+                         f"ordering cycle through l{l27}, l{l28} based on "
+                         f"{', '.join(expect_obs)}")
+        # 顺序图 SVG 使用同一结果：仅短环两节点标红
+        svg = inkseal.render_svg(a)
+        self.assertEqual(svg.count('fill="#fdecea"'), 2)
+        # 签结冻结的复算 JSON 与当前分析逐字节一致
+        _, snap = inkseal.signoff(self.store, doc, "28层112边")
+        self.assertEqual(inkseal.canon(snap["analysis"]), inkseal.canon(a))
+
+
+# --------------------------------------------------------------------------- #
 # 签结 / 版本差异 / SVG
 # --------------------------------------------------------------------------- #
 
@@ -963,6 +1078,69 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(len(a["cycles"]), 1)
         self.assertEqual(a["cycles"][0]["nodes"], [lids["墨一"], lids["印一"]])
         self.assertEqual(a["cycles"][0]["observations"], sorted(short_obs))
+        _, svg = self._req("GET", f"/api/documents/{doc}/svg")
+        self.assertEqual(svg.count('fill="#fdecea"'), 2)
+        _, v = self._req("POST", f"/api/documents/{doc}/signoff",
+                         {"note": "v"}, 201)
+        _, rec = self._req("GET", f"/api/versions/{v['version']}/recompute")
+        self.assertEqual(rec["cycles"], a["cycles"])
+        self.assertEqual(rec["defects"], a["defects"])
+
+    def test_shortest_cycle_survives_cap_over_http(self):
+        st, r = self._req("POST", "/api/documents", {
+            "summary": "28层112边", "reviewers": REVIEWERS,
+            "canvas": {"w": 1000, "h": 1400}}, 201)
+        doc = r["document"]
+        sizes = [3, 5, 5, 5, 3, 5]
+        kinds = ["ink", "seal", "ink", "seal", "ink", "seal"]
+        groups, kind_of = [], {}
+        for gi, (size, kind) in enumerate(zip(sizes, kinds)):
+            group = []
+            for k in range(size):
+                _, r = self._req("POST", f"/api/documents/{doc}/layers",
+                                 {"name": f"g{gi}n{k}", "kind": kind}, 201)
+                group.append(r["layer"])
+                kind_of[r["layer"]] = kind
+            groups.append(group)
+        pair = []
+        for name, kind in (("落款墨迹", "ink"), ("印章印文", "seal")):
+            _, r = self._req("POST", f"/api/documents/{doc}/layers",
+                             {"name": name, "kind": kind}, 201)
+            pair.append(r["layer"])
+            kind_of[r["layer"]] = kind
+        l27, l28 = pair  # 本文档第 27、28 个图层（全局 id 依测试次序递增）
+        edge_specs = []
+        for i in range(6):
+            for a in groups[i]:
+                for b in groups[(i + 1) % 6]:
+                    edge_specs.append((a, b))
+        edge_specs += [(l27, l28), (l28, l27)]
+        self.assertEqual(len(edge_specs), 112)
+        short_obs = []
+        for idx, (a, b) in enumerate(edge_specs):
+            _, r = self._req("POST", f"/api/documents/{doc}/intersections",
+                             {"layer_ids": [a, b],
+                              "coordinate": {"x": 50, "y": 50}}, 201)
+            iid = r["intersection"]
+            direction = "ink_first" if kind_of[a] == "ink" else "seal_first"
+            who = "rA" if idx % 2 == 0 else "rB"
+            _, r = self._req("POST", f"/api/documents/{doc}/observations", {
+                "intersection": iid, "direction": direction, "strength": 5,
+                "reviewer": who, "modality": "microscopy",
+                "observed_at": OBS_AT, "calibration": CAL_OK}, 201)
+            oid = r["observation"]
+            self._req("POST", f"/api/observations/{oid}/reviews",
+                      {"reviewer": who, "decision": "accept",
+                       "rationale": f"边{idx}可采"}, 201)
+            if (a, b) in ((l27, l28), (l28, l27)):
+                short_obs.append(oid)
+        _, a = self._req("GET", f"/api/documents/{doc}/analysis")
+        self.assertFalse(a["conclusion"]["definitive"])
+        self.assertEqual([c["nodes"] for c in a["cycles"]], [[l27, l28]])
+        self.assertEqual(a["cycles"][0]["observations"], sorted(short_obs))
+        cyc = [d for d in a["defects"] if d["kind"] == "contradiction_cycle"]
+        self.assertEqual(len(cyc), 1)
+        self.assertEqual(a["conclusion"]["blocking_defect_count"], 1)
         _, svg = self._req("GET", f"/api/documents/{doc}/svg")
         self.assertEqual(svg.count('fill="#fdecea"'), 2)
         _, v = self._req("POST", f"/api/documents/{doc}/signoff",

@@ -33,7 +33,7 @@
 
 ```bash
 python3 inkseal.py --db inkseal.db --host 127.0.0.1 --port 8080
-python3 -m unittest test_inkseal -v   # 49 个测试
+python3 -m unittest test_inkseal -v   # 54 个测试
 ```
 
 ## 端点
@@ -100,3 +100,5 @@ GET  /api/health
   否则登记 `broken_chain`，避免把局部污染当成整页顺序。
 - 环污染判定：去掉环边后仍可达的对象对才允许进入 `order`，
   环内/仅靠回边成立的对出现在 `tainted_pairs`，且整体结论必为 inconclusive。
+- 环枚举先 BFS 求全图最短环长、再只枚举该长度的环：枚举上限只截断
+  「最短环本身的个数」，高分支组件的绕行长环不会挤掉别处的更短环。

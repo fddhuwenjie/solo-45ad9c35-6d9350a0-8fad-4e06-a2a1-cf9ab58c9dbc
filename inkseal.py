@@ -401,16 +401,47 @@ def tarjan_scc(nodes, edges):
     return result
 
 
-def enumerate_simple_cycles(nodes, edges, cap=CYCLE_ENUM_CAP):
-    """枚举简单环（图很小：页面上只有若干图层对象）。
+def cycle_girth(nodes, adj):
+    """有向图的最短环长；无环返回 None。自环不计（本模型无自环）。
 
-    以每个节点为起点做不重复访问的 DFS，回到起点即得到一个环；
-    随后归一为“环内最小 id 开头”并去重。带 cap 保护，结果上限截断。
-    返回节点序列环（首节点 = 环内最小 id，不重复收尾节点）。
+    从每个节点 BFS，首次回到起点的边给出过该点的最短环；
+    已找到的更短环会截枝。O(n·(n+e))，图很小。
+    """
+    best = None
+    for s in sorted(nodes):
+        dist = {s: 0}
+        queue = [s]
+        while queue:
+            node = queue.pop(0)
+            d = dist[node] + 1
+            if best is not None and d >= best:
+                break  # 队列按距离非减，之后不可能更短
+            for w in adj[node]:
+                if w == s:
+                    if d >= 2:
+                        best = d if best is None else min(best, d)
+                elif w not in dist:
+                    dist[w] = d
+                    queue.append(w)
+    return best
+
+
+def enumerate_simple_cycles(nodes, edges, cap=CYCLE_ENUM_CAP):
+    """枚举最短简单环（长度 = 全图最短环长）。
+
+    先 BFS 求最短环长 L，再只枚举长度恰为 L 的环：枚举上限 cap
+    只会截断“最短环本身的个数”，高分支组件的长环绝不会挤占
+    名额、让别处的更短环被遗漏。每个环只从“环内最小 id”出发、
+    只访问更大 id 的节点，恰好枚举一次，无需事后去重。
+    返回节点序列环（首节点 = 环内最小 id），按 (长度, 节点序列)
+    排序，顺序确定。
     """
     adj = defaultdict(set)
     for a, b in edges:
         adj[a].add(b)
+    girth = cycle_girth(nodes, adj)
+    if girth is None:
+        return [], False
     found = []
     truncated = False
 
@@ -421,11 +452,11 @@ def enumerate_simple_cycles(nodes, edges, cap=CYCLE_ENUM_CAP):
         while stack:
             node, path, visited = stack.pop()
             for w in sorted(adj[node]):
-                if w == start and len(path) >= 2:
+                if w == start and len(path) == girth:
                     found.append(list(path))
                     if len(found) >= cap:
                         return True
-                elif w not in visited:
+                elif w not in visited and w > start and len(path) < girth:
                     stack.append((w, path + (w,), visited | {w}))
         return False
 
@@ -434,13 +465,7 @@ def enumerate_simple_cycles(nodes, edges, cap=CYCLE_ENUM_CAP):
             truncated = True
             break
 
-    # 一个环会从其每个节点各被枚举一次：归一为“最小节点开头”并去重。
-    uniq = {}
-    for ring in found:
-        imin = min(range(len(ring)), key=lambda i: str(ring[i]))
-        norm = tuple(ring[imin:] + ring[:imin])
-        uniq.setdefault(norm, True)
-    rings = [list(r) for r in uniq]
+    rings = [list(r) for r in found]
     rings.sort(key=lambda r: (len(r), [str(x) for x in r]))
     return rings, truncated
 
@@ -809,8 +834,9 @@ def analyze(store, doc_id):
                    ix_id=None)
     if truncated:
         add_defect("contradiction_cycle",
-                   f"cycle enumeration capped at {CYCLE_ENUM_CAP}; "
-                   "further cycles may exist but every displayed cycle is real")
+                   f"shortest-cycle enumeration capped at {CYCLE_ENUM_CAP}; "
+                   "further shortest cycles may exist but every displayed "
+                   "cycle is a real shortest cycle")
 
     reach = reachability(node_ids, edge_pairs)
     adj = defaultdict(list)
