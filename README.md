@@ -23,7 +23,7 @@
 | `same_point_conflict` | 同一交叉点的有效观察给出相反方向 | intersection + 全部 observations |
 | `broken_chain` | 观察挂靠在结构无效的交叉点上；或证据强度低于阈值且无补强 | observation(s) |
 | `review_pending` / `review_dispute` | 观察未被两名审查者覆盖或意见相左 | observation |
-| `contradiction_cycle` | 推断图成环（只给出节点数最少的环与其全部见证观察；并列最短全部保留） | cycle nodes + observations |
+| `contradiction_cycle` | 推断图成环（给出节点数最少的全部环与其见证观察；并列最短完整保留，不截断） | cycle nodes + observations |
 
 冲突并不要求删除数据：两名审查者可独立 `accept/exclude`；意见相左时由
 `adjudicate` 裁决，**采纳/排除/裁决都强制写理由并派生一条追加式修订**
@@ -33,7 +33,7 @@
 
 ```bash
 python3 inkseal.py --db inkseal.db --host 127.0.0.1 --port 8080
-python3 -m unittest test_inkseal -v   # 54 个测试
+python3 -m unittest test_inkseal -v   # 56 个测试
 ```
 
 ## 端点
@@ -100,5 +100,6 @@ GET  /api/health
   否则登记 `broken_chain`，避免把局部污染当成整页顺序。
 - 环污染判定：去掉环边后仍可达的对象对才允许进入 `order`，
   环内/仅靠回边成立的对出现在 `tainted_pairs`，且整体结论必为 inconclusive。
-- 环枚举先 BFS 求全图最短环长、再只枚举该长度的环：枚举上限只截断
-  「最短环本身的个数」，高分支组件的绕行长环不会挤掉别处的更短环。
+- 环枚举先 BFS 求全图最短环长、再只枚举该长度的环：高分支组件的
+  绕行长环不会挤掉别处的更短环；并列最短环不设上限，完整集合按
+  确定顺序返回。

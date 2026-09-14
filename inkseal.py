@@ -44,7 +44,6 @@ VALID_LAYER_KINDS = ("ink", "seal", "other")
 VALID_REVIEW_DECISIONS = ("accept", "exclude")
 VALID_MODALITIES = ("microscopy", "multispectral", "other")
 DECISION_REVISIONS = ("review", "adjudicate")
-CYCLE_ENUM_CAP = 500
 
 # 签结时被冻结的规则集。任何改动都会改变 rules_digest，旧版本仍可复算。
 RULES = {
@@ -426,13 +425,13 @@ def cycle_girth(nodes, adj):
     return best
 
 
-def enumerate_simple_cycles(nodes, edges, cap=CYCLE_ENUM_CAP):
-    """枚举最短简单环（长度 = 全图最短环长）。
+def enumerate_simple_cycles(nodes, edges):
+    """枚举全部最短简单环（长度 = 全图最短环长），完整集合。
 
-    先 BFS 求最短环长 L，再只枚举长度恰为 L 的环：枚举上限 cap
-    只会截断“最短环本身的个数”，高分支组件的长环绝不会挤占
-    名额、让别处的更短环被遗漏。每个环只从“环内最小 id”出发、
-    只访问更大 id 的节点，恰好枚举一次，无需事后去重。
+    先 BFS 求最短环长 L，再只枚举长度恰为 L 的环：高分支组件的
+    长环不会挤占名额、让别处的更短环被遗漏；并列最短环不设上限，
+    一个不少地完整返回。每个环只从“环内最小 id”出发、只访问
+    更大 id 的节点，恰好枚举一次，无需事后去重。
     返回节点序列环（首节点 = 环内最小 id），按 (长度, 节点序列)
     排序，顺序确定。
     """
@@ -441,12 +440,10 @@ def enumerate_simple_cycles(nodes, edges, cap=CYCLE_ENUM_CAP):
         adj[a].add(b)
     girth = cycle_girth(nodes, adj)
     if girth is None:
-        return [], False
+        return []
     found = []
-    truncated = False
 
     def simple_dfs(start):
-        nonlocal truncated
         # 用元组传递路径，避免回溯时可变状态出错；邻接按 id 排序保证确定性。
         stack = [(start, (start,), frozenset((start,)))]
         while stack:
@@ -454,20 +451,14 @@ def enumerate_simple_cycles(nodes, edges, cap=CYCLE_ENUM_CAP):
             for w in sorted(adj[node]):
                 if w == start and len(path) == girth:
                     found.append(list(path))
-                    if len(found) >= cap:
-                        return True
                 elif w not in visited and w > start and len(path) < girth:
                     stack.append((w, path + (w,), visited | {w}))
-        return False
 
     for s in sorted(nodes):
-        if simple_dfs(s):
-            truncated = True
-            break
+        simple_dfs(s)
 
-    rings = [list(r) for r in found]
-    rings.sort(key=lambda r: (len(r), [str(x) for x in r]))
-    return rings, truncated
+    found.sort(key=lambda r: (len(r), [str(x) for x in r]))
+    return found
 
 
 def shortest_cycles(rings):
@@ -809,7 +800,7 @@ def analyze(store, doc_id):
     # 自环也视为环（本模型一般无自环）
     cyclic_nodes = {n for comp in cyclic_components for n in comp}
 
-    rings, truncated = enumerate_simple_cycles(node_ids, edge_pairs)
+    rings = enumerate_simple_cycles(node_ids, edge_pairs)
     rings = shortest_cycles(rings)
 
     cycles_out = []
@@ -832,11 +823,6 @@ def analyze(store, doc_id):
                    f"ordering cycle through {', '.join(ref('l', n) for n in ring)} "
                    f"based on {', '.join(sorted(set(witness_obs)))}",
                    ix_id=None)
-    if truncated:
-        add_defect("contradiction_cycle",
-                   f"shortest-cycle enumeration capped at {CYCLE_ENUM_CAP}; "
-                   "further shortest cycles may exist but every displayed "
-                   "cycle is a real shortest cycle")
 
     reach = reachability(node_ids, edge_pairs)
     adj = defaultdict(list)
