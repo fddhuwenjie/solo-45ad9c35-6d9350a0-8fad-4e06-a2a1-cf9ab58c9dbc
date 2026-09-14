@@ -18,7 +18,7 @@
 每条「采纳」的观察变成一条带证据强度的有向边 pred -> succ
 （ink_first：ink -> seal；seal_first：seal -> ink）。
 同一对图层身份的边跨交叉点合并取最强证据，强度 >= edge_min_strength 才成立。
-在有向图上求可达偏序：可比对、不可比对、SCC 最小矛盾环。
+在有向图上求可达偏序：可比对、不可比对、节点数最少的矛盾环。
 
 下列任一情况存在，结果 definitive=false，并把缺陷定位回原始观察：
 坐标越界 / 图层错绑 / 校准失效 / 同点观察冲突 / 证据链断裂 /
@@ -445,22 +445,17 @@ def enumerate_simple_cycles(nodes, edges, cap=CYCLE_ENUM_CAP):
     return rings, truncated
 
 
-def minimal_cycles(rings):
-    """保留边集包含意义上的极小环。"""
-    edge_sets = []
-    for r in rings:
-        es = frozenset((r[i], r[(i + 1) % len(r)]) for i in range(len(r)))
-        edge_sets.append(es)
-    keep = []
-    for i, es in enumerate(edge_sets):
-        contained = False
-        for j, other in enumerate(edge_sets):
-            if i != j and other < es:
-                contained = True
-                break
-        if not contained:
-            keep.append(rings[i])
-    return keep
+def shortest_cycles(rings):
+    """只保留节点数最少的环。
+
+    同一矛盾可能同时引出短环与绕行长环；定位以最短环为准，
+    长环只是同一矛盾的间接转述。输入已由 enumerate_simple_cycles
+    按 (长度, 节点序列) 排序，并列最短的多个环全部保留且顺序确定。
+    """
+    if not rings:
+        return []
+    shortest = min(len(r) for r in rings)
+    return [r for r in rings if len(r) == shortest]
 
 
 def reachability(nodes, edge_list):
@@ -790,7 +785,7 @@ def analyze(store, doc_id):
     cyclic_nodes = {n for comp in cyclic_components for n in comp}
 
     rings, truncated = enumerate_simple_cycles(node_ids, edge_pairs)
-    rings = minimal_cycles(rings)
+    rings = shortest_cycles(rings)
 
     cycles_out = []
     cycle_obs = set()
@@ -1151,11 +1146,25 @@ def render_svg(analysis):
 # 写入服务（被 HTTP 层调用，也可直接被测试调用）
 # --------------------------------------------------------------------------- #
 
+def normalize_reviewer_ids(reviewers):
+    """每个审查者 id 去首尾空白；非对象 / 非字符串 id 记为 None。"""
+    ids = []
+    for r in reviewers:
+        rid = r.get("id") if isinstance(r, dict) else None
+        ids.append(rid.strip() if isinstance(rid, str) else None)
+    return ids
+
+
 def create_document(store, body):
     summary = require(body, "summary", str)
     reviewers = require(body, "reviewers", list)
-    if len(reviewers) != 2 or any(not r.get("id") for r in reviewers):
-        raise HttpError(422, "bad_reviewers", "exactly two reviewers with ids are required")
+    # 同一人不得充当两名审查者：id 去空白后都必须非空且互不相同
+    ids = normalize_reviewer_ids(reviewers)
+    if len(ids) != 2 or any(not rid for rid in ids) or ids[0] == ids[1]:
+        raise HttpError(422, "bad_reviewers",
+                        "exactly two reviewers with distinct non-blank ids "
+                        "are required")
+    normalized = [dict(r, id=rid) for r, rid in zip(reviewers, ids)]
     canvas = body.get("canvas")
     if canvas is not None and (not all(k in canvas for k in ("w", "h"))):
         raise HttpError(400, "bad_canvas", "canvas must be {w,h}")
@@ -1163,7 +1172,8 @@ def create_document(store, body):
         cur = store.execute(
             "INSERT INTO documents(summary,reviewers,examiner,canvas,created_at) "
             "VALUES(?,?,?,?,?)",
-            (summary, json.dumps(reviewers, ensure_ascii=False), body.get("examiner"),
+            (summary, json.dumps(normalized, ensure_ascii=False),
+             body.get("examiner"),
              json.dumps(canvas) if canvas else None, now_iso()))
         store.commit()
         return cur.lastrowid
@@ -1249,10 +1259,19 @@ def add_observation(store, doc_id, body):
         return cur.lastrowid, external
 
 
+def require_nonblank_rationale(body):
+    """采纳 / 排除 / 裁决都必须给出非空白理由；拒绝时不得写入任何数据。"""
+    rationale = require(body, "rationale", str)
+    if not rationale.strip():
+        raise HttpError(422, "blank_rationale",
+                        "rationale must be non-blank after trimming whitespace")
+    return rationale
+
+
 def add_review(store, obs_id, body):
     reviewer = require(body, "reviewer", str)
     decision = require(body, "decision", str)
-    rationale = require(body, "rationale", str)
+    rationale = require_nonblank_rationale(body)
     if decision not in VALID_REVIEW_DECISIONS:
         raise HttpError(422, "bad_decision",
                         f"decision must be {VALID_REVIEW_DECISIONS}")
@@ -1285,7 +1304,7 @@ def add_review(store, obs_id, body):
 
 def adjudicate(store, ix_id, body):
     arbiter = require(body, "arbiter", str)
-    rationale = require(body, "rationale", str)
+    rationale = require_nonblank_rationale(body)
     accepted_refs = require(body, "accepted_observations", list)
     ix = store.execute("SELECT * FROM intersections WHERE id=?", (ix_id,)).fetchone()
     if not ix:

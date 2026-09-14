@@ -117,12 +117,14 @@ class GraphTests(unittest.TestCase):
             key=lambda c: c[0])
         self.assertEqual(comps, [[1, 2], [3, 4]])
 
-    def test_minimal_cycles(self):
-        rings = inkseal.minimal_cycles([
-            [1, 2], [2, 3, 1], [1, 2, 4, 3],
-        ])
-        # 长度 3 的环若被长度 2 的环真包含则淘汰
-        self.assertIn([1, 2], rings)
+    def test_shortest_cycles(self):
+        # 短环与绕行长环并存时，只保留节点数最少的环
+        self.assertEqual(inkseal.shortest_cycles(
+            [[1, 2], [2, 3, 1], [1, 2, 4, 3]]), [[1, 2]])
+        # 并列最短全部保留，保持给定（已排序）顺序
+        self.assertEqual(inkseal.shortest_cycles(
+            [[3, 4], [1, 2], [1, 3, 2]]), [[3, 4], [1, 2]])
+        self.assertEqual(inkseal.shortest_cycles([]), [])
 
     def test_simple_cycle_enumeration_and_normalization(self):
         nodes = [1, 2, 3]
@@ -481,6 +483,175 @@ class ValidationTests(StoreFixture):
 
 
 # --------------------------------------------------------------------------- #
+# 回归：审查者身份去重 / 理由非空白
+# --------------------------------------------------------------------------- #
+
+class ReviewerIdentityTests(StoreFixture):
+    def test_duplicate_reviewer_ids_rejected(self):
+        for dups in ([{"id": "rA"}, {"id": "rA"}],
+                     [{"id": "rA"}, {"id": " rA "}],
+                     [{"id": " rA", "name": "甲"}, {"id": "rA\t", "name": "乙"}]):
+            with self.assertRaises(inkseal.HttpError) as cm:
+                inkseal.create_document(self.store,
+                                        {"summary": "x", "reviewers": list(dups)})
+            self.assertEqual(cm.exception.status, 422)
+            self.assertEqual(cm.exception.code, "bad_reviewers")
+
+    def test_blank_or_missing_reviewer_id_rejected(self):
+        for bad in ([{"id": "   "}, {"id": "rB"}],
+                    [{"id": ""}, {"id": "rB"}],
+                    [{"name": "缺id"}, {"id": "rB"}],
+                    [{"id": "rA"}, "not-an-object"],
+                    [{"id": 7}, {"id": "rB"}]):
+            with self.assertRaises(inkseal.HttpError) as cm:
+                inkseal.create_document(self.store,
+                                        {"summary": "x", "reviewers": list(bad)})
+            self.assertEqual(cm.exception.code, "bad_reviewers")
+
+    def test_reviewer_ids_stripped_and_usable(self):
+        doc = inkseal.create_document(self.store, {
+            "summary": "x",
+            "reviewers": [{"id": "  rA ", "name": "甲"},
+                          {"id": "rB\t", "name": "乙"}]})
+        stored = [r["id"] for r in json.loads(
+            self.store.get_document(doc)["reviewers"])]
+        self.assertEqual(stored, ["rA", "rB"])
+        # 归一化后审查按去空白 id 正常匹配
+        ink = inkseal.add_layer(self.store, doc, {"name": "墨", "kind": "ink"})
+        seal = inkseal.add_layer(self.store, doc, {"name": "印", "kind": "seal"})
+        iid = intersection(self.store, doc, ink, seal)
+        o1 = observe(self.store, doc, iid, reviewer="rA")
+        self.assertEqual(review(self.store, o1, "rA", "accept", "甲确认"), 1)
+
+
+class BlankRationaleTests(StoreFixture):
+    def _doc_obs(self):
+        doc = new_doc(self.store)
+        ink, seal, _ = layers(self.store, doc)
+        iid = intersection(self.store, doc, ink, seal)
+        oid = observe(self.store, doc, iid, reviewer="rA")
+        return doc, iid, oid
+
+    def _write_counts(self, doc):
+        reviews = self.store.execute(
+            "SELECT COUNT(*) AS c FROM reviews").fetchone()["c"]
+        return reviews, len(self.store.revisions(doc))
+
+    def test_blank_review_rationale_rejected_without_writes(self):
+        doc, iid, oid = self._doc_obs()
+        before = self._write_counts(doc)
+        for blank in ("", "   ", " \t\n "):
+            with self.assertRaises(inkseal.HttpError) as cm:
+                review(self.store, oid, "rA", "accept", blank)
+            self.assertEqual(cm.exception.status, 422)
+            self.assertEqual(cm.exception.code, "blank_rationale")
+        # 拒绝请求未新增 reviews / revisions
+        self.assertEqual(self._write_counts(doc), before)
+        a = inkseal.analyze(self.store, doc)
+        self.assertIn("review_pending", defects_by_kind(a))
+
+    def test_blank_exclude_rationale_rejected(self):
+        doc, iid, oid = self._doc_obs()
+        with self.assertRaises(inkseal.HttpError) as cm:
+            review(self.store, oid, "rA", "exclude", "  ")
+        self.assertEqual(cm.exception.code, "blank_rationale")
+        self.assertEqual(self._write_counts(doc), (0, 0))
+
+    def test_blank_adjudication_rationale_rejected_without_writes(self):
+        doc, iid, oid = self._doc_obs()
+        o2 = observe(self.store, doc, iid, direction="seal_first", reviewer="rB")
+        review(self.store, oid, "rA", "accept", "甲采纳")
+        review(self.store, o2, "rB", "accept", "乙采纳")
+        before = self._write_counts(doc)
+        with self.assertRaises(inkseal.HttpError) as cm:
+            adjudicate(self.store, iid, "rA", [oid], "   ")
+        self.assertEqual(cm.exception.code, "blank_rationale")
+        self.assertEqual(self._write_counts(doc), before)
+
+    def test_whitespace_padded_rationale_accepted(self):
+        doc, iid, oid = self._doc_obs()
+        seq = review(self.store, oid, "rA", "accept", "  墨膜覆盖印泥，可采  ")
+        self.assertEqual(seq, 1)
+
+
+# --------------------------------------------------------------------------- #
+# 回归：矛盾环只报节点数最少的环
+# --------------------------------------------------------------------------- #
+
+class ShortestCycleTests(StoreFixture):
+    def _theta_doc(self):
+        """短环 ink1⇄seal1 与绕行长环 ink1→seal2→ink2→seal1→ink1 并存。"""
+        doc = new_doc(self.store)
+        ink1 = inkseal.add_layer(self.store, doc, {"name": "墨一", "kind": "ink"})
+        seal1 = inkseal.add_layer(self.store, doc, {"name": "印一", "kind": "seal"})
+        ink2 = inkseal.add_layer(self.store, doc, {"name": "墨二", "kind": "ink"})
+        seal2 = inkseal.add_layer(self.store, doc, {"name": "印二", "kind": "seal"})
+        specs = [
+            (ink1, seal1, "ink_first"),   # 短环边 ink1 -> seal1
+            (ink1, seal1, "seal_first"),  # 短环边 seal1 -> ink1
+            (ink1, seal2, "ink_first"),   # 绕行边 ink1 -> seal2
+            (ink2, seal2, "seal_first"),  # 绕行边 seal2 -> ink2
+            (ink2, seal1, "ink_first"),   # 绕行边 ink2 -> seal1
+        ]
+        obs = []
+        for idx, (la, lb, direction) in enumerate(specs):
+            iid = intersection(self.store, doc, la, lb, x=10 * (idx + 1), y=10)
+            who = "rA" if idx % 2 == 0 else "rB"
+            o = observe(self.store, doc, iid, direction=direction, reviewer=who)
+            review(self.store, o, who, "accept", f"观察{idx}理由充分")
+            obs.append(o)
+        return doc, (ink1, seal1, ink2, seal2), obs
+
+    def test_only_shortest_cycle_reported_everywhere(self):
+        doc, (ink1, seal1, ink2, seal2), obs = self._theta_doc()
+        a = inkseal.analyze(self.store, doc)
+        self.assertFalse(a["conclusion"]["definitive"])
+        # 只报节点数最少的环，绕行长环不再返回
+        self.assertEqual(len(a["cycles"]), 1)
+        cycle = a["cycles"][0]
+        self.assertEqual(cycle["nodes"], [f"l{ink1}", f"l{seal1}"])
+        self.assertEqual(cycle["observations"], [f"o{obs[0]}", f"o{obs[1]}"])
+        # 阻断缺陷与同一结果一致：只定位短环及其见证观察
+        cyc_defects = defects_by_kind(a)["contradiction_cycle"]
+        self.assertEqual(len(cyc_defects), 1)
+        msg = cyc_defects[0]["message"]
+        for token in (f"l{ink1}", f"l{seal1}", f"o{obs[0]}", f"o{obs[1]}"):
+            self.assertIn(token, msg)
+        for token in (f"l{ink2}", f"l{seal2}",
+                      f"o{obs[2]}", f"o{obs[3]}", f"o{obs[4]}"):
+            self.assertNotIn(token, msg)
+        # 顺序图 SVG 使用同一结果：仅短环两节点标红
+        svg = inkseal.render_svg(a)
+        self.assertEqual(svg.count('fill="#fdecea"'), 2)
+        self.assertIn("INCONCLUSIVE", svg)
+        # 签结冻结的复算 JSON 与当前分析逐字节一致
+        _, snap = inkseal.signoff(self.store, doc, "冻结最短环")
+        self.assertEqual(inkseal.canon(snap["analysis"]), inkseal.canon(a))
+
+    def test_multiple_shortest_cycles_kept_in_deterministic_order(self):
+        doc = new_doc(self.store)
+        ink1 = inkseal.add_layer(self.store, doc, {"name": "墨一", "kind": "ink"})
+        seal1 = inkseal.add_layer(self.store, doc, {"name": "印一", "kind": "seal"})
+        ink2 = inkseal.add_layer(self.store, doc, {"name": "墨二", "kind": "ink"})
+        seal2 = inkseal.add_layer(self.store, doc, {"name": "印二", "kind": "seal"})
+        specs = [
+            (ink1, seal1, "ink_first"), (ink1, seal1, "seal_first"),
+            (ink2, seal2, "ink_first"), (ink2, seal2, "seal_first"),
+        ]
+        for idx, (la, lb, direction) in enumerate(specs):
+            iid = intersection(self.store, doc, la, lb, x=10 * (idx + 1), y=10)
+            who = "rA" if idx % 2 == 0 else "rB"
+            o = observe(self.store, doc, iid, direction=direction, reviewer=who)
+            review(self.store, o, who, "accept", f"理由{idx}")
+        a1 = inkseal.analyze(self.store, doc)
+        a2 = inkseal.analyze(self.store, doc)
+        self.assertEqual(inkseal.canon(a1), inkseal.canon(a2))
+        # 两个并列最短环全部保留，按确定顺序（节点 id 升序）
+        self.assertEqual([c["nodes"] for c in a1["cycles"]],
+                         [[f"l{ink1}", f"l{seal1}"], [f"l{ink2}", f"l{seal2}"]])
+
+
+# --------------------------------------------------------------------------- #
 # 签结 / 版本差异 / SVG
 # --------------------------------------------------------------------------- #
 
@@ -696,6 +867,109 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(r["error"], "not_found")
         st, r = self._req("POST", "/api/documents", {"summary": "x"}, 400)
         self.assertEqual(r["error"], "missing_field")
+
+    def test_reviewer_ids_validated_over_http(self):
+        for bad in ([{"id": "rA"}, {"id": "rA"}],
+                    [{"id": "rA"}, {"id": " rA\t"}],
+                    [{"id": " "}, {"id": "rB"}],
+                    [{"id": "rA"}, {"name": "缺id"}]):
+            st, r = self._req("POST", "/api/documents",
+                              {"summary": "x", "reviewers": bad}, 422)
+            self.assertEqual(r["error"], "bad_reviewers")
+        # 合法：去空白后不同的两人；id 归一化存储
+        st, r = self._req("POST", "/api/documents", {
+            "summary": "x",
+            "reviewers": [{"id": " rA ", "name": "甲"},
+                          {"id": "rB", "name": "乙"}]}, 201)
+        doc = r["document"]
+        _, d = self._req("GET", f"/api/documents/{doc}")
+        self.assertEqual([x["id"] for x in d["reviewers"]], ["rA", "rB"])
+
+    def test_blank_rationale_rejected_over_http(self):
+        st, r = self._req("POST", "/api/documents", {
+            "summary": "空白理由案", "reviewers": REVIEWERS,
+            "canvas": {"w": 500, "h": 500}}, 201)
+        doc = r["document"]
+        _, r = self._req("POST", f"/api/documents/{doc}/layers",
+                         {"name": "墨", "kind": "ink"}, 201)
+        ink = r["layer"]
+        _, r = self._req("POST", f"/api/documents/{doc}/layers",
+                         {"name": "印", "kind": "seal"}, 201)
+        seal = r["layer"]
+        _, r = self._req("POST", f"/api/documents/{doc}/intersections",
+                         {"layer_ids": [ink, seal],
+                          "coordinate": {"x": 10, "y": 10}}, 201)
+        iid = r["intersection"]
+        _, r = self._req("POST", f"/api/documents/{doc}/observations", {
+            "intersection": iid, "direction": "ink_first", "strength": 5,
+            "reviewer": "rA", "modality": "microscopy",
+            "observed_at": OBS_AT, "calibration": CAL_OK}, 201)
+        o1 = r["observation"]
+        for blank in ("", "   ", " \t "):
+            st, r = self._req("POST", f"/api/observations/{o1}/reviews",
+                              {"reviewer": "rA", "decision": "accept",
+                               "rationale": blank}, 422)
+            self.assertEqual(r["error"], "blank_rationale")
+        st, r = self._req("POST", f"/api/intersections/{iid}/adjudicate", {
+            "arbiter": "rA", "accepted_observations": [o1],
+            "rationale": "  "}, 422)
+        self.assertEqual(r["error"], "blank_rationale")
+        # 拒绝请求未写入：分析仍待审查，签结快照中 reviews / revisions 为空
+        _, a = self._req("GET", f"/api/documents/{doc}/analysis")
+        self.assertIn("review_pending", {d["kind"] for d in a["defects"]})
+        _, v = self._req("POST", f"/api/documents/{doc}/signoff",
+                         {"note": "核查"}, 201)
+        _, snap = self._req("GET", f"/api/versions/{v['version']}")
+        self.assertEqual(snap["snapshot"]["decisions"]["reviews"], [])
+        self.assertEqual(snap["snapshot"]["decisions"]["revisions"], [])
+
+    def test_shortest_cycle_only_over_http(self):
+        st, r = self._req("POST", "/api/documents", {
+            "summary": "环案", "reviewers": REVIEWERS,
+            "canvas": {"w": 500, "h": 500}}, 201)
+        doc = r["document"]
+        lids = {}
+        for name, kind in (("墨一", "ink"), ("印一", "seal"),
+                           ("墨二", "ink"), ("印二", "seal")):
+            _, r = self._req("POST", f"/api/documents/{doc}/layers",
+                             {"name": name, "kind": kind}, 201)
+            lids[name] = r["layer"]
+        specs = [
+            ("墨一", "印一", "ink_first"),   # 短环边
+            ("墨一", "印一", "seal_first"),  # 短环边
+            ("墨一", "印二", "ink_first"),   # 绕行长环边
+            ("墨二", "印二", "seal_first"),  # 绕行长环边
+            ("墨二", "印一", "ink_first"),   # 绕行长环边
+        ]
+        short_obs = []
+        for idx, (a_name, b_name, direction) in enumerate(specs):
+            _, r = self._req("POST", f"/api/documents/{doc}/intersections", {
+                "layer_ids": [lids[a_name], lids[b_name]],
+                "coordinate": {"x": 10 * (idx + 1), "y": 10}}, 201)
+            iid = r["intersection"]
+            who = "rA" if idx % 2 == 0 else "rB"
+            _, r = self._req("POST", f"/api/documents/{doc}/observations", {
+                "intersection": iid, "direction": direction, "strength": 5,
+                "reviewer": who, "modality": "microscopy",
+                "observed_at": OBS_AT, "calibration": CAL_OK}, 201)
+            oid = r["observation"]
+            self._req("POST", f"/api/observations/{oid}/reviews",
+                      {"reviewer": who, "decision": "accept",
+                       "rationale": f"理由{idx}"}, 201)
+            if idx < 2:
+                short_obs.append(oid)
+        _, a = self._req("GET", f"/api/documents/{doc}/analysis")
+        self.assertFalse(a["conclusion"]["definitive"])
+        self.assertEqual(len(a["cycles"]), 1)
+        self.assertEqual(a["cycles"][0]["nodes"], [lids["墨一"], lids["印一"]])
+        self.assertEqual(a["cycles"][0]["observations"], sorted(short_obs))
+        _, svg = self._req("GET", f"/api/documents/{doc}/svg")
+        self.assertEqual(svg.count('fill="#fdecea"'), 2)
+        _, v = self._req("POST", f"/api/documents/{doc}/signoff",
+                         {"note": "v"}, 201)
+        _, rec = self._req("GET", f"/api/versions/{v['version']}/recompute")
+        self.assertEqual(rec["cycles"], a["cycles"])
+        self.assertEqual(rec["defects"], a["defects"])
 
     def test_health(self):
         _, r = self._req("GET", "/api/health")

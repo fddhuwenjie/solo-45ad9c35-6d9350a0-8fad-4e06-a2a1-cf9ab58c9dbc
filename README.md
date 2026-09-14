@@ -10,7 +10,7 @@
 
 1. 每条显微/多光谱**观察**只变成一条带证据强度（1–5）的有向先后边；
 2. 同一交叉点的多条观察按**图层对象身份**合并，跨交叉点取最强证据并计印证数；
-3. 在有向图上求可达偏序，输出**可确定的顺序、互不具有可比性的对象对、最小矛盾环**；
+3. 在有向图上求可达偏序，输出**可确定的顺序、互不具有可比性的对象对、节点数最少的矛盾环**；
 4. 只要存在阻断性缺陷，一律 `definitive=false`，并把缺陷定位回原始观察。
 
 ## 阻断条件（任一存在即不下确定结论）
@@ -23,7 +23,7 @@
 | `same_point_conflict` | 同一交叉点的有效观察给出相反方向 | intersection + 全部 observations |
 | `broken_chain` | 观察挂靠在结构无效的交叉点上；或证据强度低于阈值且无补强 | observation(s) |
 | `review_pending` / `review_dispute` | 观察未被两名审查者覆盖或意见相左 | observation |
-| `contradiction_cycle` | 推断图成环（给出最小环与其全部见证观察） | cycle nodes + observations |
+| `contradiction_cycle` | 推断图成环（只给出节点数最少的环与其全部见证观察；并列最短全部保留） | cycle nodes + observations |
 
 冲突并不要求删除数据：两名审查者可独立 `accept/exclude`；意见相左时由
 `adjudicate` 裁决，**采纳/排除/裁决都强制写理由并派生一条追加式修订**
@@ -33,13 +33,14 @@
 
 ```bash
 python3 inkseal.py --db inkseal.db --host 127.0.0.1 --port 8080
-python3 -m unittest test_inkseal -v   # 37 个测试
+python3 -m unittest test_inkseal -v   # 49 个测试
 ```
 
 ## 端点
 
 ```
-POST /api/documents                       建文档 {summary, reviewers:[恰好2人], canvas?}
+POST /api/documents                       建文档 {summary, reviewers:[恰好2人，
+                                           id 去空白后非空且互不相同], canvas?}
 GET  /api/documents/{d}                   文档 + 当前复算
 POST /api/documents/{d}/layers            {name, kind: ink|seal|other}
 POST /api/documents/{d}/intersections     {layer_ids:[l?,l?], coordinate:{x,y}}
@@ -49,6 +50,7 @@ POST /api/documents/{d}/observations      {intersection, direction: ink_first|se
                                            calibration:{instrument, valid_until}}
 POST /api/observations/{o}/reviews        {reviewer, decision: accept|exclude, rationale}
 POST /api/intersections/{i}/adjudicate    {arbiter, accepted_observations, rationale}
+                                          （rationale 去空白后须非空，否则 422 且不写入）
 GET  /api/documents/{d}/analysis          确定性复算 JSON
 GET  /api/documents/{d}/svg               当前顺序图 SVG（环节点标红）
 POST /api/documents/{d}/signoff           {note?} → 冻结版本
